@@ -1,0 +1,20 @@
+{
+  "name": "donnih-web",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Adaptasi web lokal Kedai Don.Nih! dengan React, Python, dan SQLite",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "setup:frontend": "npm --prefix frontend ci",
+    "dev": "npm --prefix frontend run dev",
+    "build": "npm --prefix frontend run build",
+    "typecheck": "npm --prefix frontend run typecheck",
+    "test:e2e:install": "npm --prefix frontend run test:e2e:install",
+    "test:e2e": "npm --prefix frontend run test:e2e"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "^6.1.2"
+  }
+}

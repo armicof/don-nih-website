@@ -1,0 +1,6 @@
+node_modules/
+dist/
+*.local
+e2e/.tmp/
+e2e/results/
+e2e/report/
