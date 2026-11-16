@@ -1,4 +1,4 @@
-"""Local HTTP host for JSON API, uploaded images and the built web application."""
+"""HTTP host for JSON API, uploaded images and the built web application."""
 
 from __future__ import annotations
 
@@ -7,11 +7,12 @@ import json
 import logging
 import mimetypes
 import os
-import sqlite3
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
+
+import psycopg
 
 from backend.app import ApiError, Application
 from backend.db import ROOT, connect, initialize, load_env
@@ -117,7 +118,7 @@ def create_server(database: str | Path, host: str = '127.0.0.1', port: int = 800
                 self.send_json(exc.status, {'error': str(exc)})
             except (BrokenPipeError, ConnectionResetError, TimeoutError):
                 self.close_connection = True
-            except sqlite3.OperationalError:
+            except psycopg.OperationalError:
                 LOGGER.exception('Database tidak tersedia')
                 self.send_json(503, {'error': 'Penyimpanan sedang sibuk. Coba kembali.'})
             except Exception:
@@ -129,15 +130,16 @@ def create_server(database: str | Path, host: str = '127.0.0.1', port: int = 800
             if path.startswith('/uploads/'):
                 db = connect(database)
                 try:
-                    image = db.execute('SELECT content_type,content FROM uploads WHERE path=?', (path,)).fetchone()
+                    image = db.execute('SELECT content_type,content FROM uploads WHERE path=%s', (path,)).fetchone()
                 finally:
                     db.close()
                 if not image:
                     raise ApiError(404, 'Gambar tidak ditemukan.')
+                raw_bytes = bytes(image['content'])
                 self.send_response(200)
-                self.send_security_headers(image['content_type'], len(image['content']), cache='public, max-age=3600')
+                self.send_security_headers(image['content_type'], len(raw_bytes), cache='public, max-age=3600')
                 if self.command != 'HEAD':
-                    self.wfile.write(image['content'])
+                    self.wfile.write(raw_bytes)
                 return
             target = (dist / path.lstrip('/')).resolve()
             if not target.is_relative_to(dist.resolve()) or any(part.startswith('.') for part in Path(path).parts):
@@ -171,11 +173,17 @@ def create_server(database: str | Path, host: str = '127.0.0.1', port: int = 800
 
 def main():
     load_env()
-    parser = argparse.ArgumentParser(description='API dan web lokal Kedai Don.Nih!')
+    parser = argparse.ArgumentParser(description='API dan web Kedai Don.Nih!')
     parser.add_argument('--host', default=os.environ.get('HOST', '127.0.0.1'))
     parser.add_argument('--port', type=int, default=int(os.environ.get('PORT', '8000')))
-    parser.add_argument('--database', default=os.environ.get('DATABASE_PATH', str(ROOT / 'data' / 'donnih.sqlite3')))
+    parser.add_argument(
+        '--database',
+        default=os.environ.get('DATABASE_URL', ''),
+        help='PostgreSQL connection URI (default: DATABASE_URL)',
+    )
     args = parser.parse_args()
+    if not args.database:
+        parser.exit(1, 'Gagal: DATABASE_URL belum diatur di environment atau .env.\n')
     initialize(args.database)
     origins = {item.strip().rstrip('/') for item in os.environ.get('WEB_ORIGINS',
         'http://localhost:5173,http://127.0.0.1:5173,http://localhost:8000,http://127.0.0.1:8000').split(',') if item.strip()}
@@ -185,7 +193,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     server = create_server(args.database, args.host, args.port, origins,
                            os.environ.get('COOKIE_SECURE', 'false').lower() == 'true', hours)
-    print(f'Don.Nih! berjalan di http://{args.host}:{args.port} (SQLite lokal, bukan Supabase).', flush=True)
+    print(f'Don.Nih! berjalan di http://{args.host}:{args.port} (Supabase PostgreSQL).', flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
