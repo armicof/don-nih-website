@@ -45,10 +45,14 @@ jobs:
           cd release && zip -r ../app.zip .
 
       - name: Deploy to Azure Web App
+        id: deploy-webapp
         uses: azure/webapps-deploy@v3
         with:
-          app-name: ${{ vars.WEBAPP_NAME }}
-          slot-name: 'Production'
-          package: deployment-package
+          app-name: ${{ vars.AZURE_WEBAPP_NAME || 'cafe-pos' }}
           publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+          package: app.zip
 
+      - name: Verify production health endpoint
+        run: |
+          sleep 15
+          curl -f "https://cafe-pos-b6fdh7c7d9g2dbdb.indonesiacentral-01.azurewebsites.net/api/health"
