@@ -38,21 +38,18 @@ jobs:
           cp -r backend release/
           mkdir -p release/frontend
           cp -r frontend/dist release/frontend/
-          cat << 'EOF' > release/requirements.txt
-          psycopg[binary]
-          psycopg-pool
-          EOF
+          printf "psycopg[binary]\npsycopg-pool\n" > release/requirements.txt
+          python -m pip install --target="release/.python_packages/lib/site-packages" -r release/requirements.txt
           cd release && zip -r ../app.zip .
 
       - name: Deploy to Azure Web App
-        id: deploy-webapp
         uses: azure/webapps-deploy@v3
         with:
-          app-name: ${{ vars.AZURE_WEBAPP_NAME || 'cafe-pos' }}
+          app-name: cafe-pos
           publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
           package: app.zip
 
       - name: Verify production health endpoint
         run: |
-          sleep 15
-          curl -f "https://cafe-pos-b6fdh7c7d9g2dbdb.indonesiacentral-01.azurewebsites.net/api/health"
+          curl --retry 12 --retry-delay 10 --retry-all-errors -f \
+            "https://cafe-pos-b6fdh7c7d9g2dbdb.indonesiacentral-01.azurewebsites.net/api/health"
