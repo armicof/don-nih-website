@@ -54,4 +54,4 @@ jobs:
       - name: Verify production health endpoint
         run: |
           sleep 15
-          curl -f "https://${{ vars.AZURE_WEBAPP_NAME }}.azurewebsites.net/api/health"
+          curl -f "${{ steps.deploy-webapp.outputs.webapp-url }}/api/health"
