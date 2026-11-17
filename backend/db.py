@@ -42,6 +42,9 @@ def _get_pool(database: str | Path) -> ConnectionPool:
             kwargs={'row_factory': dict_row, 'autocommit': False},
             min_size=1,
             max_size=10,
+            max_lifetime=300,
+            max_idle=60,
+            check=ConnectionPool.check_connection,
             open=True,
         )
     return _POOLS[conninfo]
