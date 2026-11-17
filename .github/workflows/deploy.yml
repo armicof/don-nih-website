@@ -6,6 +6,10 @@ on:
       - main
   workflow_dispatch:
 
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
   build-and-deploy:
     name: Build & Deploy to Azure
@@ -38,13 +42,28 @@ jobs:
           cp -r backend release/
           mkdir -p release/frontend
           cp -r frontend/dist release/frontend/
-          printf "psycopg[binary]\npsycopg-pool\n" > release/requirements.txt
-          python -m pip install --target="release/.python_packages/lib/site-packages" -r release/requirements.txt
+          cat << 'EOF' > release/requirements.txt
+          psycopg[binary]
+          psycopg-pool
+          EOF
           cd release && zip -r ../app.zip .
 
+      - name: Log in to Azure (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
       - name: Deploy to Azure Web App
+        id: deploy-webapp
         uses: azure/webapps-deploy@v3
         with:
-          app-name: cafe-pos
+          app-name: ${{ vars.AZURE_WEBAPP_NAME || secrets.AZURE_WEBAPP_NAME }}
           publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
           package: app.zip
+
+      - name: Verify production health endpoint
+        run: |
+          sleep 15
+          curl -f "${{ steps.deploy-webapp.outputs.webapp-url }}/api/health"
