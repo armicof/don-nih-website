@@ -12,21 +12,31 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
-import psycopg
+from pymongo.errors import PyMongoError
 
 from backend.app import ApiError, Application
-from backend.db import ROOT, connect, initialize, load_env
+from backend.db import DEFAULT_DB_NAME, ROOT, connect, initialize, load_env
 
 MAX_BODY = 2_900_000
 LOGGER = logging.getLogger('donnih')
 
 
-def create_server(database: str | Path, host: str = '127.0.0.1', port: int = 8000,
-                  allowed_origins: set[str] | None = None, secure_cookie: bool = False,
-                  session_hours: int = 168) -> ThreadingHTTPServer:
-    app = Application(database, session_hours)
-    origins = allowed_origins or {'http://localhost:5173', 'http://127.0.0.1:5173',
-                                  f'http://localhost:{port}', f'http://127.0.0.1:{port}'}
+def create_server(
+    database: str | Path,
+    host: str = '127.0.0.1',
+    port: int = 8000,
+    allowed_origins: set[str] | None = None,
+    secure_cookie: bool = False,
+    session_hours: int = 168,
+    db_name: str = DEFAULT_DB_NAME,
+) -> ThreadingHTTPServer:
+    app = Application(database, session_hours, db_name=db_name)
+    origins = allowed_origins or {
+        'http://localhost:5173',
+        'http://127.0.0.1:5173',
+        f'http://localhost:{port}',
+        f'http://127.0.0.1:{port}',
+    }
     dist = ROOT / 'frontend' / 'dist'
 
     class Handler(BaseHTTPRequestHandler):
@@ -49,7 +59,12 @@ def create_server(database: str | Path, host: str = '127.0.0.1', port: int = 800
             self.send_header('X-Frame-Options', 'DENY')
             self.send_header('Referrer-Policy', 'same-origin')
             self.send_header('Permissions-Policy', 'camera=(), microphone=(), geolocation=()')
-            self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'")
+            self.send_header(
+                'Content-Security-Policy',
+                "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+                "img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; "
+                "frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'",
+            )
             if cookie is not None:
                 value = SimpleCookie()
                 value['donnih_session'] = cookie
@@ -118,8 +133,8 @@ def create_server(database: str | Path, host: str = '127.0.0.1', port: int = 800
                 self.send_json(exc.status, {'error': str(exc)})
             except (BrokenPipeError, ConnectionResetError, TimeoutError):
                 self.close_connection = True
-            except psycopg.OperationalError:
-                LOGGER.exception('Database tidak tersedia')
+            except PyMongoError:
+                LOGGER.exception('Database MongoDB tidak tersedia')
                 self.send_json(503, {'error': 'Penyimpanan sedang sibuk. Coba kembali.'})
             except Exception:
                 LOGGER.exception('Kesalahan internal')
@@ -128,16 +143,14 @@ def create_server(database: str | Path, host: str = '127.0.0.1', port: int = 800
         def serve_static(self, raw_path):
             path = unquote(raw_path)
             if path.startswith('/uploads/'):
-                db = connect(database)
-                try:
-                    image = db.execute('SELECT content_type,content FROM uploads WHERE path=%s', (path,)).fetchone()
-                finally:
-                    db.close()
+                db = connect(database, db_name=db_name)
+                image = db['uploads'].find_one({'path': path})
                 if not image:
                     raise ApiError(404, 'Gambar tidak ditemukan.')
-                raw_bytes = bytes(image['content'])
+                raw_bytes = bytes(image.get('content', b''))
+                content_type = image.get('mime_type') or image.get('content_type') or 'application/octet-stream'
                 self.send_response(200)
-                self.send_security_headers(image['content_type'], len(raw_bytes), cache='public, max-age=3600')
+                self.send_security_headers(content_type, len(raw_bytes), cache='public, max-age=3600')
                 if self.command != 'HEAD':
                     self.wfile.write(raw_bytes)
                 return
@@ -149,10 +162,14 @@ def create_server(database: str | Path, host: str = '127.0.0.1', port: int = 800
                     raise ApiError(404, 'Berkas tidak ditemukan.')
                 target = dist / 'index.html'
             if not target.exists():
-                raise ApiError(503, 'Frontend belum dibangun. Jalankan npm --prefix frontend run build, atau buka Vite port 5173.')
+                raise ApiError(
+                    503,
+                    'Frontend belum dibangun. Jalankan npm --prefix frontend run build, atau buka Vite port 5173.',
+                )
             content = target.read_bytes()
-            mime = {'.js': 'text/javascript', '.css': 'text/css', '.html': 'text/html'}.get(target.suffix,
-                       mimetypes.guess_type(str(target))[0] or 'application/octet-stream')
+            mime = {'.js': 'text/javascript', '.css': 'text/css', '.html': 'text/html'}.get(
+                target.suffix, mimetypes.guess_type(str(target))[0] or 'application/octet-stream'
+            )
             self.send_response(200)
             self.send_security_headers(mime, len(content))
             if self.command != 'HEAD':
@@ -173,27 +190,48 @@ def create_server(database: str | Path, host: str = '127.0.0.1', port: int = 800
 
 def main():
     load_env()
+    default_uri = os.environ.get('MONGODB_URI') or os.environ.get('DATABASE_URL') or ''
+    db_name = os.environ.get('MONGODB_DB_NAME', DEFAULT_DB_NAME).strip() or DEFAULT_DB_NAME
+
     parser = argparse.ArgumentParser(description='API dan web Kedai Don.Nih!')
     parser.add_argument('--host', default=os.environ.get('HOST', '127.0.0.1'))
     parser.add_argument('--port', type=int, default=int(os.environ.get('PORT', '8000')))
     parser.add_argument(
         '--database',
-        default=os.environ.get('DATABASE_URL', ''),
-        help='PostgreSQL connection URI (default: DATABASE_URL)',
+        default=default_uri,
+        help='MongoDB connection URI (default: MONGODB_URI / DATABASE_URL)',
+    )
+    parser.add_argument(
+        '--db-name',
+        default=db_name,
+        help=f'MongoDB database name (default: {DEFAULT_DB_NAME})',
     )
     args = parser.parse_args()
     if not args.database:
-        parser.exit(1, 'Gagal: DATABASE_URL belum diatur di environment atau .env.\n')
-    initialize(args.database)
-    origins = {item.strip().rstrip('/') for item in os.environ.get('WEB_ORIGINS',
-        'http://localhost:5173,http://127.0.0.1:5173,http://localhost:8000,http://127.0.0.1:8000').split(',') if item.strip()}
+        parser.exit(1, 'Gagal: MONGODB_URI belum diatur di environment atau .env.\n')
+    initialize(args.database, db_name=args.db_name)
+    origins = {
+        item.strip().rstrip('/')
+        for item in os.environ.get(
+            'WEB_ORIGINS',
+            'http://localhost:5173,http://127.0.0.1:5173,http://localhost:8000,http://127.0.0.1:8000',
+        ).split(',')
+        if item.strip()
+    }
     hours = int(os.environ.get('SESSION_HOURS', '168'))
     if not 1 <= hours <= 720:
         parser.error('SESSION_HOURS harus 1–720.')
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-    server = create_server(args.database, args.host, args.port, origins,
-                           os.environ.get('COOKIE_SECURE', 'false').lower() == 'true', hours)
-    print(f'Don.Nih! berjalan di http://{args.host}:{args.port} (Supabase PostgreSQL).', flush=True)
+    server = create_server(
+        args.database,
+        args.host,
+        args.port,
+        origins,
+        os.environ.get('COOKIE_SECURE', 'false').lower() == 'true',
+        hours,
+        db_name=args.db_name,
+    )
+    print(f'Don.Nih! berjalan di http://{args.host}:{args.port} (MongoDB: {args.db_name}).', flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

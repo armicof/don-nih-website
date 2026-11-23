@@ -13,14 +13,16 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-import psycopg
-from psycopg import errors as pg_errors
+from bson import Binary
+from pymongo import ASCENDING, DESCENDING, ReturnDocument
+from pymongo.database import Database
+from pymongo.errors import DuplicateKeyError
 
-from backend.db import connect, hash_password, now, verify_password
+from backend.db import DEFAULT_DB_NAME, connect, hash_password, now, verify_password
 
 CATEGORIES = {'COFFEE', 'NON-COFFEE', 'DESSERT', 'BREAKFAST', 'MEAL'}
 STATUSES = ['WAITING', 'CONFIRMED', 'PROCESSED', 'COMPLETED']
-PUBLIC_USER = 'id,email,username,fullname,phone_number,avatar_url,role'
+PUBLIC_USER_FIELDS = ['id', 'email', 'username', 'fullname', 'phone_number', 'avatar_url', 'role']
 MAX_IMAGE_BYTES = 2 * 1024 * 1024
 _MISSING = object()
 # Used for a timing-equivalent password check for unknown email addresses.
@@ -59,154 +61,250 @@ def phone(value: object) -> str:
     return result
 
 
-def public_record(row: dict[str, Any]) -> dict[str, Any]:
-    result = dict(row)
+def public_record(row: dict[str, Any] | None) -> dict[str, Any]:
+    if not row:
+        return {}
+    result = {k: v for k, v in row.items() if k != '_id'}
     if 'active' in result:
         result['active'] = bool(result['active'])
     return result
 
 
+def _project_user(user_doc: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not user_doc:
+        return None
+    return {
+        'id': user_doc.get('id'),
+        'email': user_doc.get('email'),
+        'username': user_doc.get('username'),
+        'fullname': user_doc.get('fullname'),
+        'phone_number': user_doc.get('phone_number', ''),
+        'avatar_url': user_doc.get('avatar_url'),
+        'role': user_doc.get('role', 'user'),
+    }
+
+
+def _next_seq(db: Database[Any], name: str) -> int:
+    doc = db['counters'].find_one_and_update(
+        {'_id': name},
+        {'$inc': {'seq': 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return int(doc['seq'])
+
+
 class Application:
-    def __init__(self, database: str | Path, session_hours: int = 168):
+    def __init__(self, database: str | Path, session_hours: int = 168, db_name: str = DEFAULT_DB_NAME):
         self.database = database
         self.session_hours = session_hours
+        self.db_name = db_name
 
-    def request(self, method: str, target: str, body: object = _MISSING,
-                token: str = '', client_ip: str = 'local') -> Response:
+    def request(
+        self,
+        method: str,
+        target: str,
+        body: object = _MISSING,
+        token: str = '',
+        client_ip: str = 'local',
+    ) -> Response:
         body = {} if body is _MISSING else body
         if not isinstance(body, dict):
             raise ApiError(400, 'Body JSON harus berupa objek.')
-        db = connect(self.database)
+        db = connect(self.database, db_name=self.db_name)
         try:
-            db.execute('BEGIN')
             user = None
             if token:
-                user = db.execute(
-                    f'SELECT {",".join("u." + col for col in PUBLIC_USER.split(","))} FROM users u '
-                    'JOIN sessions s ON u.id=s.user_id WHERE s.token_hash=%s AND s.expires_at>%s',
-                    (hashlib.sha256(token.encode()).hexdigest(), int(time.time()))).fetchone()
+                token_hash = hashlib.sha256(token.encode()).hexdigest()
+                session_doc = db['sessions'].find_one(
+                    {'token_hash': token_hash, 'expires_at': {'$gt': int(time.time())}}
+                )
+                if session_doc:
+                    raw_user = db['users'].find_one({'id': session_doc['user_id']})
+                    user = _project_user(raw_user)
             parts = urlsplit(target)
-            response = self.dispatch(db, method, parts.path.rstrip('/'), parse_qs(parts.query), body, user, token, client_ip)
-            db.commit()
-            return response
-        except pg_errors.IntegrityError as exc:
-            db.rollback()
+            return self.dispatch(
+                db,
+                method,
+                parts.path.rstrip('/'),
+                parse_qs(parts.query),
+                body,
+                user,
+                token,
+                client_ip,
+            )
+        except DuplicateKeyError as exc:
             raise ApiError(409, 'Data sudah digunakan atau bertentangan dengan data yang tersimpan.') from exc
-        except Exception:
-            db.rollback()
-            raise
-        finally:
-            db.close()
 
     @staticmethod
     def require_user(user: dict[str, Any] | None, admin: bool = False) -> dict[str, Any]:
         if user is None:
             raise ApiError(401, 'Silakan masuk terlebih dahulu.')
-        if admin and user['role'] != 'admin':
+        if admin and user.get('role') != 'admin':
             raise ApiError(403, 'Akses ini hanya untuk admin.')
         return user
 
     @staticmethod
-    def session(db: psycopg.Connection, user_id: str, hours: int) -> str:
+    def session(db: Database[Any], user_id: str, hours: int) -> str:
         token = secrets.token_urlsafe(32)
-        db.execute('DELETE FROM sessions WHERE expires_at<=%s', (int(time.time()),))
-        db.execute('INSERT INTO sessions VALUES (%s,%s,%s)',
-                   (hashlib.sha256(token.encode()).hexdigest(), user_id, int(time.time()) + hours * 3600))
+        current_epoch = int(time.time())
+        db['sessions'].delete_many({'expires_at': {'$lte': current_epoch}})
+        db['sessions'].insert_one(
+            {
+                'token_hash': hashlib.sha256(token.encode()).hexdigest(),
+                'user_id': user_id,
+                'expires_at': current_epoch + hours * 3600,
+            }
+        )
         return token
 
     @staticmethod
-    def user_response(db: psycopg.Connection, user_id: str) -> dict:
-        return {'user': dict(db.execute(f'SELECT {PUBLIC_USER} FROM users WHERE id=%s', (user_id,)).fetchone())}
+    def user_response(db: Database[Any], user_id: str) -> dict[str, Any]:
+        raw_user = db['users'].find_one({'id': user_id})
+        return {'user': _project_user(raw_user)}
 
-    def dispatch(self, db, method, path, query, body, user, token, client_ip) -> Response:
+    def dispatch(
+        self,
+        db: Database[Any],
+        method: str,
+        path: str,
+        query: dict[str, list[str]],
+        body: dict[str, Any],
+        user: dict[str, Any] | None,
+        token: str,
+        client_ip: str,
+    ) -> Response:
         if path == '/api/health' and method == 'GET':
-            demo = bool(db.execute("SELECT 1 FROM metadata WHERE key='demo_seed'").fetchone())
-            return Response({'ok': True, 'storage': 'supabase', 'demo_data': demo, 'online_payment': False})
+            demo = bool(db['metadata'].find_one({'key': 'demo_seed'}))
+            return Response(
+                {
+                    'ok': True,
+                    'storage': 'mongodb',
+                    'database': self.db_name,
+                    'demo_data': demo,
+                    'online_payment': False,
+                }
+            )
         if path == '/api/auth/me' and method == 'GET':
             return Response({'user': dict(user) if user else None})
         if path in ('/api/auth/register', '/api/auth/login') and method == 'POST':
             return self.authenticate(db, path, body, token, client_ip)
         if path == '/api/auth/logout' and method == 'POST':
-            db.execute('DELETE FROM sessions WHERE token_hash=%s', (hashlib.sha256(token.encode()).hexdigest(),))
+            if token:
+                db['sessions'].delete_one({'token_hash': hashlib.sha256(token.encode()).hexdigest()})
             return Response({'ok': True}, session='')
         if path == '/api/menus' and method == 'GET':
             search = text(query.get('search', [''])[0], 'Pencarian', 0, 100)
             category = query.get('category', [''])[0]
             if category and category not in CATEGORIES:
                 raise ApiError(400, 'Kategori tidak valid.')
-            like_pattern = f'%{search}%'
-            rows = db.execute(
-                "SELECT * FROM menus WHERE active=1 AND (name || ' ' || description) ILIKE %s "
-                "AND (%s='' OR category=%s) ORDER BY id",
-                (like_pattern, category, category),
-            ).fetchall()
+
+            mongo_filter: dict[str, Any] = {'active': 1}
+            if category:
+                mongo_filter['category'] = category
+            if search:
+                pattern = re.escape(search)
+                mongo_filter['$or'] = [
+                    {'name': {'$regex': pattern, '$options': 'i'}},
+                    {'description': {'$regex': pattern, '$options': 'i'}},
+                ]
+
+            rows = db['menus'].find(mongo_filter).sort('id', ASCENDING)
             return Response([public_record(row) for row in rows])
         if path == '/api/toppings' and method == 'GET':
-            return Response([public_record(row) for row in db.execute('SELECT * FROM toppings WHERE active=1 ORDER BY id')])
+            rows = db['toppings'].find({'active': 1}).sort('id', ASCENDING)
+            return Response([public_record(row) for row in rows])
 
         user = self.require_user(user, path.startswith('/api/admin/'))
         uid = user['id']
+
         if path == '/api/profile' and method == 'PATCH':
             name = text(body.get('fullname', user['fullname']), 'Nama lengkap', 2, 100)
-            number = phone(body.get('phone_number', user['phone_number']))
+            number = phone(body.get('phone_number', user.get('phone_number', '')))
             if set(body) - {'fullname', 'phone_number'}:
                 raise ApiError(400, 'Hanya nama lengkap dan telepon yang dapat diperbarui.')
-            db.execute('UPDATE users SET fullname=%s,phone_number=%s WHERE id=%s', (name, number, uid))
+            db['users'].update_one({'id': uid}, {'$set': {'fullname': name, 'phone_number': number}})
             return Response(self.user_response(db, uid))
+
         if path == '/api/uploads' and method == 'POST':
             return self.upload(db, body, user)
+
         if path == '/api/favorites' and method == 'GET':
-            return Response([row['menu_id'] for row in db.execute(
-                'SELECT f.menu_id FROM favorites f JOIN menus m ON m.id=f.menu_id WHERE f.user_id=%s AND m.active=1 ORDER BY f.menu_id', (uid,))])
+            favs = list(db['favorites'].find({'user_id': uid}))
+            menu_ids = [f['menu_id'] for f in favs]
+            if not menu_ids:
+                return Response([])
+            active_menus = {
+                m['id']
+                for m in db['menus'].find({'id': {'$in': menu_ids}, 'active': 1}, {'id': 1})
+            }
+            return Response(sorted(mid for mid in menu_ids if mid in active_menus))
+
         match = re.fullmatch(r'/api/favorites/(\d+)', path)
         if match and method in ('PUT', 'DELETE'):
             mid = integer(int(match[1]), 'ID menu', 1, 2**63 - 1)
             if method == 'PUT':
                 self.active_menu(db, mid)
-                db.execute('INSERT INTO favorites VALUES (%s,%s) ON CONFLICT DO NOTHING', (uid, mid))
+                db['favorites'].update_one(
+                    {'user_id': uid, 'menu_id': mid},
+                    {'$setOnInsert': {'user_id': uid, 'menu_id': mid}},
+                    upsert=True,
+                )
             else:
-                db.execute('DELETE FROM favorites WHERE user_id=%s AND menu_id=%s', (uid, mid))
+                db['favorites'].delete_one({'user_id': uid, 'menu_id': mid})
             return Response({'ok': True})
+
         if path == '/api/cart' and method == 'GET':
             return Response(self.cart(db, uid))
+
         if path == '/api/cart' and method == 'POST':
             mid = integer(body.get('menu_id'), 'Menu', 1)
             self.active_menu(db, mid)
             quantity = integer(body.get('quantity', 1), 'Jumlah', 1, 99)
             ids = self.validate_toppings(db, body.get('topping_ids'))
-            count = db.execute('SELECT COUNT(*) AS cnt FROM carts WHERE user_id=%s', (uid,)).fetchone()['cnt']
+            count = db['carts'].count_documents({'user_id': uid})
             if count >= 100:
                 raise ApiError(400, 'Keranjang maksimal 100 baris. Selesaikan pesanan terlebih dahulu.')
-            cart_id = db.execute(
-                'INSERT INTO carts (user_id,menu_id,quantity) VALUES (%s,%s,%s) RETURNING id',
-                (uid, mid, quantity),
-            ).fetchone()['id']
-            with db.cursor() as cur:
-                cur.executemany('INSERT INTO cart_toppings VALUES (%s,%s)', [(cart_id, tid) for tid in ids])
+            cart_id = _next_seq(db, 'carts')
+            db['carts'].insert_one(
+                {
+                    'id': cart_id,
+                    'user_id': uid,
+                    'menu_id': mid,
+                    'quantity': quantity,
+                    'topping_ids': ids,
+                }
+            )
             return Response(self.cart(db, uid), 201)
+
         match = re.fullmatch(r'/api/cart/(\d+)', path)
         if match and method in ('PATCH', 'DELETE'):
             cid = integer(int(match[1]), 'ID keranjang', 1, 2**63 - 1)
-            if not db.execute('SELECT 1 FROM carts WHERE id=%s AND user_id=%s', (cid, uid)).fetchone():
+            existing_cart = db['carts'].find_one({'id': cid, 'user_id': uid})
+            if not existing_cart:
                 raise ApiError(404, 'Item keranjang tidak ditemukan.')
             if method == 'DELETE':
-                db.execute('DELETE FROM carts WHERE id=%s AND user_id=%s', (cid, uid))
+                db['carts'].delete_one({'id': cid, 'user_id': uid})
             else:
                 quantity = integer(body.get('quantity'), 'Jumlah', 1, 99)
-                db.execute('UPDATE carts SET quantity=%s WHERE id=%s AND user_id=%s', (quantity, cid, uid))
+                db['carts'].update_one({'id': cid, 'user_id': uid}, {'$set': {'quantity': quantity}})
             return Response(self.cart(db, uid))
+
         if path == '/api/orders' and method == 'POST':
             return self.checkout(db, user, body)
+
         if path in ('/api/orders', '/api/admin/orders') and method == 'GET':
-            rows = db.execute('SELECT id FROM orders ' + ('WHERE user_id=%s ' if path == '/api/orders' else '') + 'ORDER BY id DESC',
-                              (uid,) if path == '/api/orders' else ()).fetchall()
+            order_filter = {'user_id': uid} if path == '/api/orders' else {}
+            rows = db['orders'].find(order_filter, {'id': 1}).sort('id', DESCENDING)
             return Response([self.order(db, row['id']) for row in rows])
+
         match = re.fullmatch(r'/api/orders/(\d+)', path)
         if match and method == 'GET':
             order = self.order(db, integer(int(match[1]), 'ID pesanan', 1, 2**63 - 1))
-            if order['user_id'] != uid and user['role'] != 'admin':
+            if order['user_id'] != uid and user.get('role') != 'admin':
                 raise ApiError(404, 'Pesanan tidak ditemukan.')
             return Response(order)
+
         match = re.fullmatch(r'/api/admin/orders/(\d+)/status', path)
         if match and method == 'PATCH':
             order = self.order(db, integer(int(match[1]), 'ID pesanan', 1, 2**63 - 1))
@@ -217,31 +315,53 @@ class Application:
             if current == 'COMPLETED' or status != STATUSES[STATUSES.index(current) + 1]:
                 raise ApiError(400, 'Status harus berurutan: WAITING → CONFIRMED → PROCESSED → COMPLETED.')
             timestamp = now()
-            db.execute('UPDATE orders SET order_status=%s,updated_at=%s WHERE id=%s', (status, timestamp, order['id']))
-            db.execute('INSERT INTO order_events (order_id,status,actor_id,created_at) VALUES (%s,%s,%s,%s)',
-                       (order['id'], status, uid, timestamp))
+            db['orders'].update_one(
+                {'id': order['id']},
+                {'$set': {'order_status': status, 'updated_at': timestamp}},
+            )
+            db['order_events'].insert_one(
+                {
+                    'id': _next_seq(db, 'order_events'),
+                    'order_id': order['id'],
+                    'status': status,
+                    'actor_id': uid,
+                    'created_at': timestamp,
+                }
+            )
             return Response(self.order(db, order['id']))
+
         if path.startswith('/api/admin/'):
             return self.admin_catalog(db, method, path, body)
+
         raise ApiError(404, 'Endpoint tidak ditemukan.')
 
-    def authenticate(self, db, path, body, old_token, client_ip) -> Response:
-        # Persist rate limits even when login fails; no user write has occurred here.
+    def authenticate(
+        self,
+        db: Database[Any],
+        path: str,
+        body: dict[str, Any],
+        old_token: str,
+        client_ip: str,
+    ) -> Response:
         epoch = int(time.time())
         key = hashlib.sha256(client_ip.encode()).hexdigest()
-        db.execute('DELETE FROM auth_attempts WHERE window_start<%s', (epoch - 600,))
-        attempt = db.execute('SELECT * FROM auth_attempts WHERE key=%s', (key,)).fetchone()
-        if attempt and attempt['attempts'] >= 20:
+        db['auth_attempts'].delete_many({'window_start': {'$lt': epoch - 600}})
+        attempt = db['auth_attempts'].find_one({'key': key})
+        if attempt and attempt.get('attempts', 0) >= 20:
             raise ApiError(429, 'Terlalu banyak percobaan. Coba kembali dalam 10 menit.')
-        db.execute('INSERT INTO auth_attempts VALUES (%s,1,%s) ON CONFLICT(key) DO UPDATE SET attempts=auth_attempts.attempts+1', (key, epoch))
-        db.commit()
-        db.execute('BEGIN')
+        db['auth_attempts'].update_one(
+            {'key': key},
+            {'$inc': {'attempts': 1}, '$setOnInsert': {'key': key, 'window_start': epoch}},
+            upsert=True,
+        )
+
         email = text(body.get('email'), 'Email', 3, 254).lower()
         if not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', email):
             raise ApiError(400, 'Format email tidak valid.')
         password = body.get('password')
         if not isinstance(password, str) or not 1 <= len(password) <= 128:
             raise ApiError(400, 'Password harus berisi 1–128 karakter.')
+
         if path.endswith('/register'):
             if len(password) < 8:
                 raise ApiError(400, 'Password minimal 8 karakter.')
@@ -252,59 +372,90 @@ class Application:
             number = phone(body.get('phone_number', ''))
             uid = str(uuid.uuid4())
             # Role is never accepted from a browser. Admins are provisioned by CLI.
-            db.execute('INSERT INTO users (id,email,username,fullname,phone_number,password_hash,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s)',
-                       (uid, email, username, fullname, number, hash_password(password), now()))
+            db['users'].insert_one(
+                {
+                    'id': uid,
+                    'email': email,
+                    'username': username,
+                    'fullname': fullname,
+                    'phone_number': number,
+                    'avatar_url': None,
+                    'role': 'user',
+                    'password_hash': hash_password(password),
+                    'created_at': now(),
+                }
+            )
         else:
-            row = db.execute('SELECT id,password_hash FROM users WHERE email=%s', (email,)).fetchone()
+            row = db['users'].find_one({'email': email})
             valid = verify_password(password, row['password_hash'] if row else DUMMY_HASH)
             if not row or not valid:
                 raise ApiError(401, 'Email atau password tidak sesuai.')
             uid = row['id']
+
         if old_token:
-            db.execute('DELETE FROM sessions WHERE token_hash=%s', (hashlib.sha256(old_token.encode()).hexdigest(),))
+            db['sessions'].delete_one({'token_hash': hashlib.sha256(old_token.encode()).hexdigest()})
         session = self.session(db, uid, self.session_hours)
         return Response(self.user_response(db, uid), 201 if path.endswith('/register') else 200, session)
 
     @staticmethod
-    def active_menu(db, mid):
-        menu = db.execute('SELECT * FROM menus WHERE id=%s AND active=1', (mid,)).fetchone()
+    def active_menu(db: Database[Any], mid: int) -> dict[str, Any]:
+        menu = db['menus'].find_one({'id': mid, 'active': 1})
         if not menu:
             raise ApiError(404, 'Menu tidak ditemukan atau sudah tidak tersedia.')
-        return menu
+        return public_record(menu)
 
     @staticmethod
-    def validate_toppings(db, ids):
-        if not isinstance(ids, list) or len(ids) > 50 or any(type(tid) is not int for tid in ids) or len(set(ids)) != len(ids):
+    def validate_toppings(db: Database[Any], ids: object) -> list[int]:
+        if (
+            not isinstance(ids, list)
+            or len(ids) > 50
+            or any(type(tid) is not int for tid in ids)
+            or len(set(ids)) != len(ids)
+        ):
             raise ApiError(400, 'Pilihan topping tidak valid atau duplikat.')
         toppings = []
         for tid in ids:
-            row = db.execute('SELECT * FROM toppings WHERE id=%s AND active=1', (tid,)).fetchone()
+            row = db['toppings'].find_one({'id': tid, 'active': 1})
             if not row:
                 raise ApiError(400, 'Salah satu topping sudah tidak tersedia.')
             toppings.append(row)
-        if sum(t['kind'] == 'size' for t in toppings) != 1 or sum(t['kind'] == 'temperature' for t in toppings) != 1:
+        if sum(t.get('kind') == 'size' for t in toppings) != 1 or sum(t.get('kind') == 'temperature' for t in toppings) != 1:
             raise ApiError(400, 'Pilih tepat satu ukuran dan satu suhu.')
         return ids
 
     @staticmethod
-    def cart(db, uid):
-        rows = db.execute('SELECT c.id,c.menu_id,c.quantity,m.name,m.img,m.price,m.active FROM carts c '
-                          'JOIN menus m ON m.id=c.menu_id WHERE c.user_id=%s ORDER BY c.id', (uid,)).fetchall()
+    def cart(db: Database[Any], uid: str) -> dict[str, Any]:
+        cart_rows = list(db['carts'].find({'user_id': uid}).sort('id', ASCENDING))
         items = []
-        for row in rows:
-            toppings = [public_record(t) for t in db.execute('SELECT t.* FROM toppings t JOIN cart_toppings ct '
-                        'ON ct.topping_id=t.id WHERE ct.cart_id=%s ORDER BY t.id', (row['id'],))]
-            unit = row['price'] + sum(t['price'] for t in toppings)
-            items.append({'id': row['id'], 'menu_id': row['menu_id'], 'name': row['name'], 'img': row['img'],
-                          'quantity': row['quantity'], 'unit_price': unit, 'total': unit * row['quantity'],
-                          'toppings': toppings, 'available': bool(row['active']) and all(t['active'] for t in toppings)})
+        for row in cart_rows:
+            menu = db['menus'].find_one({'id': row['menu_id']}) or {}
+            t_ids = row.get('topping_ids', [])
+            topping_docs = list(db['toppings'].find({'id': {'$in': t_ids}})) if t_ids else []
+            topping_by_id = {t['id']: public_record(t) for t in topping_docs}
+            toppings = [topping_by_id[tid] for tid in t_ids if tid in topping_by_id]
+            menu_price = int(menu.get('price', 0))
+            unit = menu_price + sum(int(t.get('price', 0)) for t in toppings)
+            menu_active = bool(menu.get('active', 0))
+            items.append(
+                {
+                    'id': row['id'],
+                    'menu_id': row['menu_id'],
+                    'name': menu.get('name', ''),
+                    'img': menu.get('img', ''),
+                    'quantity': row['quantity'],
+                    'unit_price': unit,
+                    'total': unit * row['quantity'],
+                    'toppings': toppings,
+                    'available': menu_active and all(t.get('active') for t in toppings),
+                }
+            )
         return {'items': items, 'total': sum(item['total'] for item in items)}
 
-    def checkout(self, db, user, body):
+    def checkout(self, db: Database[Any], user: dict[str, Any], body: dict[str, Any]) -> Response:
         key = text(body.get('idempotency_key'), 'Kunci checkout', 16, 100)
         if not re.fullmatch(r'[A-Za-z0-9_-]+', key):
             raise ApiError(400, 'Kunci checkout tidak valid.')
-        previous = db.execute('SELECT id FROM orders WHERE user_id=%s AND idempotency_key=%s', (user['id'], key)).fetchone()
+        previous = db['orders'].find_one({'user_id': user['id'], 'idempotency_key': key}, {'id': 1})
         if previous:
             return Response(self.order(db, previous['id']))
         cart = self.cart(db, user['id'])
@@ -312,106 +463,193 @@ class Application:
             raise ApiError(400, 'Keranjang masih kosong.')
         if not all(item['available'] for item in cart['items']):
             raise ApiError(409, 'Menu atau topping tidak tersedia. Hapus item tersebut dari keranjang.')
+
         timestamp = now()
-        oid = db.execute(
-            'INSERT INTO orders (user_id,customer_name,net_income,idempotency_key,created_at,updated_at) '
-            'VALUES (%s,%s,%s,%s,%s,%s) RETURNING id',
-            (user['id'], user['fullname'], cart['total'], key, timestamp, timestamp),
-        ).fetchone()['id']
+        oid = _next_seq(db, 'orders')
+        order_details = []
         for item in cart['items']:
-            db.execute('INSERT INTO order_details (order_id,menu_id,name,img,quantity,price,toppings_json) VALUES (%s,%s,%s,%s,%s,%s,%s)',
-                       (oid, item['menu_id'], item['name'], item['img'], item['quantity'], item['unit_price'],
-                        json.dumps([{'id': t['id'], 'name': t['name'], 'price': t['price']} for t in item['toppings']])))
-        db.execute('INSERT INTO order_events (order_id,status,actor_id,created_at) VALUES (%s,%s,%s,%s)',
-                   (oid, 'WAITING', user['id'], timestamp))
-        db.execute('DELETE FROM carts WHERE user_id=%s', (user['id'],))
+            order_details.append(
+                {
+                    'id': _next_seq(db, 'order_details'),
+                    'order_id': oid,
+                    'menu_id': item['menu_id'],
+                    'name': item['name'],
+                    'img': item['img'],
+                    'quantity': item['quantity'],
+                    'price': item['unit_price'],
+                    'toppings_json': json.dumps(
+                        [{'id': t['id'], 'name': t['name'], 'price': t['price']} for t in item['toppings']]
+                    ),
+                }
+            )
+
+        db['orders'].insert_one(
+            {
+                'id': oid,
+                'user_id': user['id'],
+                'customer_name': user['fullname'],
+                'net_income': cart['total'],
+                'order_status': 'WAITING',
+                'idempotency_key': key,
+                'created_at': timestamp,
+                'updated_at': timestamp,
+            }
+        )
+        if order_details:
+            db['order_details'].insert_many(order_details)
+        db['order_events'].insert_one(
+            {
+                'id': _next_seq(db, 'order_events'),
+                'order_id': oid,
+                'status': 'WAITING',
+                'actor_id': user['id'],
+                'created_at': timestamp,
+            }
+        )
+        db['carts'].delete_many({'user_id': user['id']})
         return Response(self.order(db, oid), 201)
 
     @staticmethod
-    def order(db, oid):
-        row = db.execute('SELECT * FROM orders WHERE id=%s', (oid,)).fetchone()
+    def order(db: Database[Any], oid: int) -> dict[str, Any]:
+        row = db['orders'].find_one({'id': oid})
         if not row:
             raise ApiError(404, 'Pesanan tidak ditemukan.')
-        result = dict(row)
-        del result['idempotency_key']
+        result = {k: v for k, v in row.items() if k != '_id'}
+        result.pop('idempotency_key', None)
+
         items = []
-        for detail in db.execute('SELECT * FROM order_details WHERE order_id=%s ORDER BY id', (oid,)):
-            item = dict(detail)
-            item['toppings'] = json.loads(item.pop('toppings_json'))
+        for detail in db['order_details'].find({'order_id': oid}).sort('id', ASCENDING):
+            item = {k: v for k, v in detail.items() if k != '_id'}
+            raw_toppings = item.pop('toppings_json', '[]')
+            item['toppings'] = json.loads(raw_toppings) if isinstance(raw_toppings, str) else raw_toppings
             item['total'] = item['quantity'] * item['price']
             items.append(item)
+
         result['items'] = items
-        result['events'] = [dict(event) for event in db.execute('SELECT status,created_at FROM order_events WHERE order_id=%s ORDER BY id', (oid,))]
+        result['events'] = [
+            {'status': ev.get('status'), 'created_at': ev.get('created_at')}
+            for ev in db['order_events'].find({'order_id': oid}).sort('id', ASCENDING)
+        ]
         return result
 
     @staticmethod
-    def image_path(db, value):
+    def image_path(db: Database[Any], value: object) -> str:
         path = text(value, 'Gambar', 1, 200)
-        assets = {'LogoDonnih.png', 'americano.png', 'appletea.png', 'caffelatte.png', 'curry.png',
-                  'espresso.png', 'menu_cappucino.png', 'orderhistory.png', 'pancake.png', 'peachtea.png'}
-        if path.startswith('/images/') and path[len('/images/'):] in assets:
+        assets = {
+            'LogoDonnih.png',
+            'americano.png',
+            'appletea.png',
+            'caffelatte.png',
+            'curry.png',
+            'espresso.png',
+            'menu_cappucino.png',
+            'orderhistory.png',
+            'pancake.png',
+            'peachtea.png',
+        }
+        if path.startswith('/images/') and path[len('/images/') :] in assets:
             return path
-        if db.execute("SELECT 1 FROM uploads WHERE path=%s AND kind='menu'", (path,)).fetchone():
+        if db['uploads'].find_one({'path': path, 'kind': 'menu'}, {'_id': 1}):
             return path
         raise ApiError(400, 'Gunakan aset bawaan atau unggah gambar menu terlebih dahulu.')
 
-    def admin_catalog(self, db, method, path, body):
+    def admin_catalog(self, db: Database[Any], method: str, path: str, body: dict[str, Any]) -> Response:
         match = re.fullmatch(r'/api/admin/(menus|toppings)(?:/(\d+))?', path)
         if not match:
             raise ApiError(404, 'Endpoint admin tidak ditemukan.')
-        table = match[1]
+        collection_name = match[1]
         record_id = integer(int(match[2]), 'ID katalog', 1, 2**63 - 1) if match[2] else None
+
         if method == 'GET' and record_id is None:
-            return Response([public_record(row) for row in db.execute(f'SELECT * FROM {table} ORDER BY id')])
+            rows = db[collection_name].find({}).sort('id', ASCENDING)
+            return Response([public_record(row) for row in rows])
+
         existing = None
         if record_id is not None:
-            existing = db.execute(f'SELECT * FROM {table} WHERE id=%s', (record_id,)).fetchone()
+            existing = db[collection_name].find_one({'id': record_id})
             if not existing:
                 raise ApiError(404, 'Data tidak ditemukan.')
+
         if method == 'DELETE' and existing:
-            if table == 'toppings' and existing['kind'] != 'extra':
+            if collection_name == 'toppings' and existing.get('kind') != 'extra':
                 raise ApiError(400, 'Ukuran dan suhu bawaan tidak dapat dihapus.')
-            db.execute(f'UPDATE {table} SET active=0 WHERE id=%s', (record_id,))
+            db[collection_name].update_one({'id': record_id}, {'$set': {'active': 0}})
             return Response({'ok': True})
+
         if not ((method == 'POST' and record_id is None) or (method == 'PATCH' and existing)):
             raise ApiError(405, 'Metode tidak didukung.')
-        allowed = {'name', 'price', 'active'} | ({'description', 'category', 'img'} if table == 'menus' else set())
+
+        allowed = {'name', 'price', 'active'} | (
+            {'description', 'category', 'img'} if collection_name == 'menus' else set()
+        )
         if set(body) - allowed:
             raise ApiError(400, 'Kolom katalog tidak dikenal.')
-        values = dict(existing) if existing else {}
+
+        values = {k: v for k, v in existing.items() if k != '_id'} if existing else {}
         values.update(body)
         name = text(values.get('name'), 'Nama', 2, 100)
         price = integer(values.get('price'), 'Harga')
         active = values.get('active', True)
         if 'active' in body and type(body['active']) is not bool:
             raise ApiError(400, 'Status aktif harus boolean.')
-        if table == 'menus':
+
+        if collection_name == 'menus':
             desc = text(values.get('description', ''), 'Deskripsi', 0, 1000)
             category = values.get('category')
             if not isinstance(category, str) or category not in CATEGORIES:
                 raise ApiError(400, 'Kategori tidak valid.')
             image = self.image_path(db, values.get('img', '/images/LogoDonnih.png'))
             if existing:
-                db.execute('UPDATE menus SET name=%s,price=%s,active=%s,description=%s,category=%s,img=%s WHERE id=%s',
-                           (name, price, int(active), desc, category, image, record_id))
+                db['menus'].update_one(
+                    {'id': record_id},
+                    {
+                        '$set': {
+                            'name': name,
+                            'price': price,
+                            'active': int(active),
+                            'description': desc,
+                            'category': category,
+                            'img': image,
+                        }
+                    },
+                )
             else:
-                record_id = db.execute(
-                    'INSERT INTO menus (name,price,active,description,category,img) VALUES (%s,%s,%s,%s,%s,%s) RETURNING id',
-                    (name, price, int(active), desc, category, image),
-                ).fetchone()['id']
+                record_id = _next_seq(db, 'menus')
+                db['menus'].insert_one(
+                    {
+                        'id': record_id,
+                        'name': name,
+                        'price': price,
+                        'active': int(active),
+                        'description': desc,
+                        'category': category,
+                        'img': image,
+                    }
+                )
         else:
-            if existing and existing['kind'] != 'extra' and (name != existing['name'] or not active):
+            if existing and existing.get('kind') != 'extra' and (name != existing.get('name') or not active):
                 raise ApiError(400, 'Ukuran dan suhu bawaan hanya dapat diubah harganya.')
             if existing:
-                db.execute('UPDATE toppings SET name=%s,price=%s,active=%s WHERE id=%s', (name, price, int(active), record_id))
+                db['toppings'].update_one(
+                    {'id': record_id},
+                    {'$set': {'name': name, 'price': price, 'active': int(active)}},
+                )
             else:
-                record_id = db.execute(
-                    "INSERT INTO toppings (name,price,active,kind) VALUES (%s,%s,%s,'extra') RETURNING id",
-                    (name, price, int(active)),
-                ).fetchone()['id']
-        return Response(public_record(db.execute(f'SELECT * FROM {table} WHERE id=%s', (record_id,)).fetchone()), 201 if method == 'POST' else 200)
+                record_id = _next_seq(db, 'toppings')
+                db['toppings'].insert_one(
+                    {
+                        'id': record_id,
+                        'name': name,
+                        'price': price,
+                        'active': int(active),
+                        'kind': 'extra',
+                    }
+                )
 
-    def upload(self, db, body, user):
+        updated_doc = db[collection_name].find_one({'id': record_id})
+        return Response(public_record(updated_doc), 201 if method == 'POST' else 200)
+
+    def upload(self, db: Database[Any], body: dict[str, Any], user: dict[str, Any]) -> Response:
         kind = body.get('kind')
         if kind not in ('avatar', 'menu'):
             raise ApiError(400, 'Jenis unggahan harus avatar atau menu.')
@@ -430,20 +668,34 @@ class Application:
         if not raw or len(raw) > MAX_IMAGE_BYTES:
             raise ApiError(413, 'Gambar maksimal 2 MB.')
         mime = match[1]
-        valid = ((mime == 'image/png' and raw.startswith(b'\x89PNG\r\n\x1a\n')) or
-                 (mime == 'image/jpeg' and raw.startswith(b'\xff\xd8\xff')) or
-                 (mime == 'image/webp' and raw.startswith(b'RIFF') and raw[8:12] == b'WEBP'))
+        valid = (
+            (mime == 'image/png' and raw.startswith(b'\x89PNG\r\n\x1a\n'))
+            or (mime == 'image/jpeg' and raw.startswith(b'\xff\xd8\xff'))
+            or (mime == 'image/webp' and raw.startswith(b'RIFF') and raw[8:12] == b'WEBP')
+        )
         if not valid:
             raise ApiError(400, 'Isi berkas tidak cocok dengan format gambarnya.')
-        used = db.execute('SELECT COALESCE(SUM(length(content)),0) AS total FROM uploads WHERE user_id=%s', (user['id'],)).fetchone()['total']
+
+        user_uploads = db['uploads'].find({'user_id': user['id']}, {'content': 1})
+        used = sum(len(doc.get('content', b'')) for doc in user_uploads)
         if used + len(raw) > 100 * MAX_IMAGE_BYTES:
             raise ApiError(413, 'Kuota unggahan akun tercapai (200 MB).')
+
         extension = {'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp'}[mime]
         path = f'/uploads/{uuid.uuid4().hex}.{extension}'
-        db.execute('INSERT INTO uploads VALUES (%s,%s,%s,%s,%s,%s)', (path, user['id'], kind, mime, raw, now()))
+        db['uploads'].insert_one(
+            {
+                'path': path,
+                'user_id': user['id'],
+                'kind': kind,
+                'mime_type': mime,
+                'content': Binary(raw),
+                'created_at': now(),
+            }
+        )
         if kind == 'avatar':
-            old = user['avatar_url']
-            db.execute('UPDATE users SET avatar_url=%s WHERE id=%s', (path, user['id']))
+            old = user.get('avatar_url')
+            db['users'].update_one({'id': user['id']}, {'$set': {'avatar_url': path}})
             if old:
-                db.execute("DELETE FROM uploads WHERE path=%s AND user_id=%s AND kind='avatar'", (old, user['id']))
+                db['uploads'].delete_many({'path': old, 'user_id': user['id'], 'kind': 'avatar'})
         return Response({'url': path}, 201)

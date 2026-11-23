@@ -6,15 +6,16 @@ import os
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
-import psycopg
-from psycopg.rows import dict_row
-from psycopg_pool import ConnectionPool
+from pymongo import ASCENDING, MongoClient
+from pymongo.database import Database
+from pymongo.errors import PyMongoError
 
 ROOT = Path(__file__).resolve().parent.parent
-MIGRATIONS_DIR = Path(__file__).resolve().parent / 'migrations'
+DEFAULT_DB_NAME = 'PSOFP-db123'
 
-_POOLS: dict[str, ConnectionPool] = {}
+_CLIENTS: dict[str, MongoClient[Any]] = {}
 
 
 def load_env(env_path: Path | None = None) -> None:
@@ -32,27 +33,49 @@ def load_env(env_path: Path | None = None) -> None:
         os.environ.setdefault(key, value)
 
 
-def _get_pool(database: str | Path) -> ConnectionPool:
-    conninfo = str(database) if database else os.environ.get('DATABASE_URL', '')
-    if not conninfo:
-        raise RuntimeError('DATABASE_URL is not configured.')
-    if conninfo not in _POOLS:
-        _POOLS[conninfo] = ConnectionPool(
-            conninfo=conninfo,
-            kwargs={'row_factory': dict_row, 'autocommit': False},
-            min_size=1,
-            max_size=10,
-            max_lifetime=300,
-            max_idle=60,
-            check=ConnectionPool.check_connection,
-            open=True,
+def _resolve_uri(database: str | Path = '') -> str:
+    raw = str(database).strip() if database else ''
+    if raw and not raw.startswith(('mongodb://', 'mongodb+srv://')):
+        raw = ''
+    uri = (
+        raw
+        or os.environ.get('MONGODB_URI', '').strip()
+        or (
+            os.environ.get('DATABASE_URL', '').strip()
+            if os.environ.get('DATABASE_URL', '').strip().startswith(('mongodb://', 'mongodb+srv://'))
+            else ''
         )
-    return _POOLS[conninfo]
+    )
+    if not uri:
+        raise RuntimeError(
+            'MONGODB_URI belum diatur. Isi MONGODB_URI di file .env (contoh: mongodb+srv://... atau mongodb://localhost:27017).'
+        )
+    return uri
 
 
-def connect(database: str | Path = '') -> psycopg.Connection:
-    """Return a pooled PostgreSQL connection with dict_row enabled."""
-    return _get_pool(database).getconn()
+def get_client(database: str | Path = '') -> MongoClient[Any]:
+    """Return a cached MongoClient instance (manages connection pool internally)."""
+    uri = _resolve_uri(database)
+    if uri not in _CLIENTS:
+        _CLIENTS[uri] = MongoClient(
+            uri,
+            maxPoolSize=10,
+            minPoolSize=1,
+            maxIdleTimeMS=60_000,
+            serverSelectionTimeoutMS=5_000,
+        )
+    return _CLIENTS[uri]
+
+
+def connect(database: str | Path = '', db_name: str | None = None) -> Database[Any]:
+    """Return the MongoDB Database handle for PSOFP-db123 (or override via env/arg)."""
+    client = get_client(database)
+    target_db = (
+        db_name
+        or os.environ.get('MONGODB_DB_NAME', '').strip()
+        or DEFAULT_DB_NAME
+    )
+    return client[target_db]
 
 
 def now() -> str:
@@ -85,67 +108,120 @@ def verify_password(password: str, stored_hash: str) -> bool:
         return False
 
 
-def initialize(database: str | Path = '') -> None:
-    """Run all SQL migration files in backend/migrations/ in sorted order."""
-    db = connect(database)
+def initialize(database: str | Path = '', db_name: str | None = None) -> None:
+    """Ensure required MongoDB collections and indexes exist in PSOFP-db123."""
+    db = connect(database, db_name=db_name)
     try:
-        db.execute('BEGIN')
-        for sql_file in sorted(MIGRATIONS_DIR.glob('*.sql')):
-            sql = sql_file.read_text(encoding='utf-8').strip()
-            if sql:
-                db.execute(sql)
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
+        db['metadata'].create_index([('key', ASCENDING)], unique=True)
+        db['toppings'].create_index([('id', ASCENDING)], unique=True)
+        db['toppings'].create_index([('name', ASCENDING), ('kind', ASCENDING)])
+        db['menus'].create_index([('id', ASCENDING)], unique=True)
+        db['menus'].create_index([('category', ASCENDING), ('active', ASCENDING)])
+        db['users'].create_index([('id', ASCENDING)], unique=True)
+        db['users'].create_index([('email', ASCENDING)], unique=True)
+        db['users'].create_index([('username', ASCENDING)], unique=True)
+        db['sessions'].create_index([('token_hash', ASCENDING)], unique=True)
+        db['carts'].create_index([('id', ASCENDING)], unique=True)
+        db['orders'].create_index([('id', ASCENDING)], unique=True)
+    except PyMongoError as exc:
+        raise RuntimeError(
+            f'Gagal terhubung atau menginisialisasi MongoDB ({exc}). '
+            'Pastikan service MongoDB lokal sudah berjalan atau MONGODB_URI di .env mengarah ke MongoDB Atlas yang aktif.'
+        ) from exc
 
 
-def seed_demo(database: str | Path = '') -> None:
+def seed_demo(database: str | Path = '', db_name: str | None = None) -> None:
     """Insert initial demo catalog (menus, toppings, and metadata flag) if not already seeded."""
-    db = connect(database)
+    db = connect(database, db_name=db_name)
     try:
-        db.execute('BEGIN')
-        already_seeded = db.execute("SELECT 1 FROM metadata WHERE key = 'demo_seed'").fetchone()
+        already_seeded = db['metadata'].find_one({'key': 'demo_seed'})
         if already_seeded:
-            db.commit()
             return
 
         # Required base toppings (1 size + 1 temperature required by validate_toppings)
         toppings = [
-            ('Regular', 0, 1, 'size'),
-            ('Large', 5000, 1, 'size'),
-            ('Hot', 0, 1, 'temperature'),
-            ('Iced', 2000, 1, 'temperature'),
-            ('Extra Espresso Shot', 6000, 1, 'extra'),
-            ('Caramel Drizzle', 4000, 1, 'extra'),
+            {'id': 1, 'name': 'Regular', 'price': 0, 'active': 1, 'kind': 'size'},
+            {'id': 2, 'name': 'Large', 'price': 5000, 'active': 1, 'kind': 'size'},
+            {'id': 3, 'name': 'Hot', 'price': 0, 'active': 1, 'kind': 'temperature'},
+            {'id': 4, 'name': 'Iced', 'price': 2000, 'active': 1, 'kind': 'temperature'},
+            {'id': 5, 'name': 'Extra Espresso Shot', 'price': 6000, 'active': 1, 'kind': 'extra'},
+            {'id': 6, 'name': 'Caramel Drizzle', 'price': 4000, 'active': 1, 'kind': 'extra'},
         ]
-        for name, price, active, kind in toppings:
-            db.execute(
-                'INSERT INTO toppings (name, price, active, kind) VALUES (%s, %s, %s, %s)',
-                (name, price, active, kind),
-            )
 
         menus = [
-            ('Americano', 18000, 1, 'Espresso klasik dengan air panas atau dingin.', 'COFFEE', '/images/americano.png'),
-            ('Caffe Latte', 24000, 1, 'Espresso lembut dengan susu steamed.', 'COFFEE', '/images/caffelatte.png'),
-            ('Cappuccino', 24000, 1, 'Espresso dengan busa susu tebal.', 'COFFEE', '/images/menu_cappucino.png'),
-            ('Peach Tea', 20000, 1, 'Teh segar dengan aroma buah persik.', 'NON-COFFEE', '/images/peachtea.png'),
-            ('Apple Tea', 20000, 1, 'Teh manis segar rasa apel.', 'NON-COFFEE', '/images/appletea.png'),
-            ('Classic Pancake', 28000, 1, 'Pancake hangat dengan sirup maple.', 'BREAKFAST', '/images/pancake.png'),
-            ('Japanese Curry', 38000, 1, 'Nasi kari Jepang gurih dan hangat.', 'MEAL', '/images/curry.png'),
+            {
+                'id': 1,
+                'name': 'Americano',
+                'price': 18000,
+                'active': 1,
+                'description': 'Espresso klasik dengan air panas atau dingin.',
+                'category': 'COFFEE',
+                'img': '/images/americano.png',
+            },
+            {
+                'id': 2,
+                'name': 'Caffe Latte',
+                'price': 24000,
+                'active': 1,
+                'description': 'Espresso lembut dengan susu steamed.',
+                'category': 'COFFEE',
+                'img': '/images/caffelatte.png',
+            },
+            {
+                'id': 3,
+                'name': 'Cappuccino',
+                'price': 24000,
+                'active': 1,
+                'description': 'Espresso dengan busa susu tebal.',
+                'category': 'COFFEE',
+                'img': '/images/menu_cappucino.png',
+            },
+            {
+                'id': 4,
+                'name': 'Peach Tea',
+                'price': 20000,
+                'active': 1,
+                'description': 'Teh segar dengan aroma buah persik.',
+                'category': 'NON-COFFEE',
+                'img': '/images/peachtea.png',
+            },
+            {
+                'id': 5,
+                'name': 'Apple Tea',
+                'price': 20000,
+                'active': 1,
+                'description': 'Teh manis segar rasa apel.',
+                'category': 'NON-COFFEE',
+                'img': '/images/appletea.png',
+            },
+            {
+                'id': 6,
+                'name': 'Classic Pancake',
+                'price': 28000,
+                'active': 1,
+                'description': 'Pancake hangat dengan sirup maple.',
+                'category': 'BREAKFAST',
+                'img': '/images/pancake.png',
+            },
+            {
+                'id': 7,
+                'name': 'Japanese Curry',
+                'price': 38000,
+                'active': 1,
+                'description': 'Nasi kari Jepang gurih dan hangat.',
+                'category': 'MEAL',
+                'img': '/images/curry.png',
+            },
         ]
-        for name, price, active, desc, category, img in menus:
-            db.execute(
-                'INSERT INTO menus (name, price, active, description, category, img) VALUES (%s, %s, %s, %s, %s, %s)',
-                (name, price, active, desc, category, img),
-            )
 
-        db.execute("INSERT INTO metadata (key, value) VALUES ('demo_seed', '1') ON CONFLICT (key) DO NOTHING")
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
+        db['toppings'].insert_many(toppings)
+        db['menus'].insert_many(menus)
+        db['counters'].update_one({'_id': 'toppings'}, {'$max': {'seq': len(toppings)}}, upsert=True)
+        db['counters'].update_one({'_id': 'menus'}, {'$max': {'seq': len(menus)}}, upsert=True)
+        db['metadata'].update_one(
+            {'key': 'demo_seed'},
+            {'$setOnInsert': {'key': 'demo_seed', 'value': '1'}},
+            upsert=True,
+        )
+    except PyMongoError as exc:
+        raise RuntimeError(f'Gagal mengisi data demo ke MongoDB: {exc}') from exc
