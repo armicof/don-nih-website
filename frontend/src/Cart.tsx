@@ -6,6 +6,26 @@ import { useStore } from './store';
 import { Empty, ErrorBox, Loading, Modal, PageHeading, PaymentNotice, ProductImage } from './ui';
 import type { Cart as CartData, Order } from './types';
 
+function createCheckoutKey() {
+  const cryptoApi = globalThis.crypto;
+  if (typeof cryptoApi?.randomUUID === 'function') return cryptoApi.randomUUID();
+
+  // randomUUID is restricted to secure contexts in some browsers. getRandomValues
+  // still works on HTTP; retain a last-resort fallback for older browser engines.
+  const bytes = new Uint8Array(16);
+  if (typeof cryptoApi?.getRandomValues === 'function') {
+    cryptoApi.getRandomValues(bytes);
+  } else {
+    for (let index = 0; index < bytes.length; index += 1) {
+      bytes[index] = Math.floor(Math.random() * 256);
+    }
+  }
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 export function Cart() {
   const store = useStore();
   const { cart } = store;
@@ -26,7 +46,7 @@ export function Cart() {
     if (!retryKey.current || retryKey.current.fingerprint !== fingerprint) {
       let stored: { fingerprint: string; key: string } | null = null;
       try { stored = JSON.parse(sessionStorage.getItem(storageKey) || 'null'); } catch { /* Use a new in-memory key if storage is unavailable. */ }
-      retryKey.current = stored?.fingerprint === fingerprint && typeof stored.key === 'string' ? stored : { fingerprint, key: crypto.randomUUID() };
+      retryKey.current = stored?.fingerprint === fingerprint && typeof stored.key === 'string' ? stored : { fingerprint, key: createCheckoutKey() };
     }
     // Keep the same key after a lost response; never duplicate an accepted order on retry.
     try { sessionStorage.setItem(storageKey, JSON.stringify(retryKey.current)); } catch { /* The ref preserves retries for this mounted page. */ }
