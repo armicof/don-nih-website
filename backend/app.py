@@ -199,25 +199,26 @@ class Application:
             if category and category not in CATEGORIES:
                 raise ApiError(400, 'Kategori tidak valid.')
 
-            mongo_filter: dict[str, Any] = {'active': 1}
+            conditions: list[dict[str, Any]] = [{'active': 1}]
             if category:
-                mongo_filter['category'] = category
+                conditions.append({'category': category})
             if search:
                 pattern = re.escape(search)
-                mongo_filter['$or'] = [
-                    {'name': {'$regex': pattern, '$options': 'i'}},
-                    {'description': {'$regex': pattern, '$options': 'i'}},
-                ]
+                conditions.append({
+                    '$or': [
+                        {'name': {'$regex': pattern, '$options': 'i'}},
+                        {'description': {'$regex': pattern, '$options': 'i'}},
+                    ]
+                })
 
-            rows = db['menus'].find(mongo_filter).sort('id', ASCENDING)
+            rows = db['menus'].find({'$and': conditions}).sort('id', ASCENDING)
             return Response([public_record(row) for row in rows])
         if path == '/api/toppings' and method == 'GET':
             rows = db['toppings'].find({'active': 1}).sort('id', ASCENDING)
             return Response([public_record(row) for row in rows])
-
         user = self.require_user(user, path.startswith('/api/admin/'))
         uid = user['id']
-
+        
         if path == '/api/profile' and method == 'PATCH':
             name = text(body.get('fullname', user['fullname']), 'Nama lengkap', 2, 100)
             number = phone(body.get('phone_number', user.get('phone_number', '')))
@@ -368,6 +369,8 @@ class Application:
             username = text(body.get('username'), 'Username', 3, 30)
             if not re.fullmatch(r'[A-Za-z0-9_.-]+', username):
                 raise ApiError(400, 'Username hanya boleh huruf, angka, titik, garis bawah, atau tanda hubung.')
+            if db['users'].find_one({'username': {'$regex': f'^{re.escape(username)}$', '$options': 'i'}}):
+                raise ApiError(409, 'Data sudah digunakan atau bertentangan dengan data yang tersimpan.')
             fullname = text(body.get('fullname'), 'Nama lengkap', 2, 100)
             number = phone(body.get('phone_number', ''))
             uid = str(uuid.uuid4())
@@ -483,32 +486,55 @@ class Application:
                 }
             )
 
-        db['orders'].insert_one(
+        try:
+            db['orders'].insert_one(
+                {
+                    'id': oid,
+                    'user_id': user['id'],
+                    'customer_name': user['fullname'],
+                    'net_income': cart['total'],
+                    'order_status': 'WAITING',
+                    'idempotency_key': key,
+                    'created_at': timestamp,
+                    'updated_at': timestamp,
+                }
+            )
+        except DuplicateKeyError:
+            existing_order = db['orders'].find_one({'user_id': user['id'], 'idempotency_key': key}, {'id': 1})
+            if existing_order:
+                db['order_events'].update_one(
+                    {'order_id': existing_order['id'], 'status': 'WAITING'},
+                    {
+                        '$setOnInsert': {
+                            'id': _next_seq(db, 'order_events'),
+                            'order_id': existing_order['id'],
+                            'status': 'WAITING',
+                            'actor_id': user['id'],
+                            'created_at': timestamp,
+                        }
+                    },
+                    upsert=True,
+                )
+                return Response(self.order(db, existing_order['id']), 200)
+            raise
+
+        db['order_events'].update_one(
+            {'order_id': oid, 'status': 'WAITING'},
             {
-                'id': oid,
-                'user_id': user['id'],
-                'customer_name': user['fullname'],
-                'net_income': cart['total'],
-                'order_status': 'WAITING',
-                'idempotency_key': key,
-                'created_at': timestamp,
-                'updated_at': timestamp,
-            }
+                '$setOnInsert': {
+                    'id': _next_seq(db, 'order_events'),
+                    'order_id': oid,
+                    'status': 'WAITING',
+                    'actor_id': user['id'],
+                    'created_at': timestamp,
+                }
+            },
+            upsert=True,
         )
         if order_details:
             db['order_details'].insert_many(order_details)
-        db['order_events'].insert_one(
-            {
-                'id': _next_seq(db, 'order_events'),
-                'order_id': oid,
-                'status': 'WAITING',
-                'actor_id': user['id'],
-                'created_at': timestamp,
-            }
-        )
         db['carts'].delete_many({'user_id': user['id']})
         return Response(self.order(db, oid), 201)
-
     @staticmethod
     def order(db: Database[Any], oid: int) -> dict[str, Any]:
         row = db['orders'].find_one({'id': oid})

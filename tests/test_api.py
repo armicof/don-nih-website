@@ -5,7 +5,10 @@ Admin fixtures are provisioned out of band, like the local CLI, never via the AP
 """
 
 from __future__ import annotations
-
+import sys
+import threading
+import time
+import unittest
 import base64
 import hashlib
 import json
@@ -27,7 +30,7 @@ from typing import Any, cast
 from urllib.parse import urlencode
 
 from backend.app import MAX_IMAGE_BYTES, Application
-from backend.db import connect, initialize, seed_demo, verify_password
+from backend.db import connect, initialize, load_env, seed_demo, verify_password
 from backend.server import MAX_BODY, create_server
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,6 +43,7 @@ PNG = base64.b64decode(
 
 
 def _mongo_uri() -> str:
+    load_env()
     uri = (os.environ.get('MONGODB_URI') or os.environ.get('DATABASE_URL') or '').strip()
     if not uri:
         raise unittest.SkipTest('MONGODB_URI is not configured for MongoDB integration tests.')
@@ -892,7 +896,15 @@ class APIIntegrationTests(_MongoTestCase):
             with self.subTest(search=search):
                 expected = [m for m in self.menus if search.lower() in (m['name'] + ' ' + m['description']).lower()]
                 self.assertEqual(self.expect(self.client, 'GET', '/api/menus?' + urlencode({'search': search})), expected)
-        self.assertEqual(self.expect(self.client, 'GET', '/api/menus?search=Tea&category=COFFEE'), [])
+        expected_coffee_tea = [
+            m
+            for m in self.menus
+            if m['category'] == 'COFFEE' and 'tea' in (m['name'] + ' ' + m['description']).lower()
+        ]
+        self.assertEqual(
+            self.expect(self.client, 'GET', '/api/menus?search=Tea&category=COFFEE'),
+            expected_coffee_tea,
+        )
         tea = self.expect(self.client, 'GET', '/api/menus?search=Tea&category=NON-COFFEE')
         self.assertEqual(len(tea), 2)
         self.expect(self.client, 'GET', '/api/menus?category=INVALID', status=400)

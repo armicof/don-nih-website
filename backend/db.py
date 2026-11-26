@@ -122,7 +122,10 @@ def initialize(database: str | Path = '', db_name: str | None = None) -> None:
         db['users'].create_index([('username', ASCENDING)], unique=True)
         db['sessions'].create_index([('token_hash', ASCENDING)], unique=True)
         db['carts'].create_index([('id', ASCENDING)], unique=True)
-        db['orders'].create_index([('id', ASCENDING)], unique=True)
+        db['orders'].create_index(
+            [('user_id', ASCENDING), ('idempotency_key', ASCENDING)],
+            unique=True,
+        )
     except PyMongoError as exc:
         raise RuntimeError(
             f'Gagal terhubung atau menginisialisasi MongoDB ({exc}). '
