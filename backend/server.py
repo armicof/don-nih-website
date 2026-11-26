@@ -49,7 +49,9 @@ def create_server(
 
         def log_message(self, format, *args):
             # Do not log passwords, cookies, request bodies or query strings.
-            LOGGER.info('%s %s %s', self.address_string(), self.command, urlsplit(self.path).path)
+            command = getattr(self, 'command', '-')
+            path = urlsplit(getattr(self, 'path', '/')).path if hasattr(self, 'path') else '-'
+            LOGGER.info('%s %s %s', self.address_string(), command, path)
 
         def send_security_headers(self, content_type, size, *, cache='no-store', cookie=None):
             self.send_header('Content-Type', content_type)

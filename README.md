@@ -2,7 +2,7 @@
 
 Adaptasi web dari [raffidevaa/don.nih](https://github.com/raffidevaa/don.nih). Identitas cokelat/krem, aset menu asli, pilihan ukuran/suhu, dan alur pelanggan/admin dipertahankan serta disesuaikan untuk web responsif. Snapshot Flutter `mobile-source/` hanya referensi lokal opsional, diabaikan Git, dan **tidak diperlukan** untuk install, build, atau menjalankan aplikasi setelah clone.
 
-**Ini aplikasi lokal yang berfungsi, bukan koneksi ke data kedai produksi.** Katalog seed menggunakan nama/aset sumber, tetapi harga, deskripsi, dan extra topping adalah **contoh rekaan**. Tidak ada akun bawaan, transaksi uang, sinkronisasi Supabase, atau pembayaran Midtrans. Database dan akun yang Anda buat benar-benar disimpan di SQLite lokal.
+**Ini aplikasi lokal yang berfungsi, bukan koneksi ke data kedai produksi.** Katalog seed menggunakan nama/aset sumber, tetapi harga, deskripsi, dan extra topping adalah **contoh rekaan**. Tidak ada akun bawaan, transaksi uang, sinkronisasi Supabase, atau pembayaran Midtrans. Database menggunakan MongoDB yang ditentukan melalui `MONGODB_URI`.
 
 ## Fitur
 
@@ -18,8 +18,8 @@ Adaptasi web dari [raffidevaa/don.nih](https://github.com/raffidevaa/don.nih). I
 
 ## Prasyarat
 
-- Node.js **22+**, npm, Python **3.11+** (termasuk SQLite dan dukungan `hashlib.scrypt`).
-- Backend menggunakan standard library Python; tidak perlu `pip install`, Docker, Flutter SDK, atau akun cloud.
+- Node.js **22+**, npm, Python **3.11+**, dan MongoDB (lokal, Atlas, atau compatible service).
+- Pasang backend dependency dengan `python -m pip install -r requirements.txt`.
 - Internet hanya diperlukan untuk instalasi npm dan browser pengujian pertama kali. Aset/font aplikasi tidak bergantung CDN.
 
 Semua perintah berikut dijalankan dari root proyek. Di Windows, gunakan `python`; di Linux/macOS biasanya `python3`.
@@ -34,9 +34,10 @@ Semua perintah berikut dijalankan dari root proyek. Di Windows, gunakan `python`
 
    Pada Linux/macOS gunakan `cp .env.example .env`.
 
-2. Install, bangun frontend, dan siapkan database beserta katalog **demo**:
+2. Install dependency, bangun frontend, dan siapkan MongoDB beserta katalog **demo**:
 
    ```sh
+   python -m pip install -r requirements.txt
    npm --prefix frontend ci
    npm --prefix frontend run build
    python -m backend.cli init --demo
@@ -53,7 +54,7 @@ Semua perintah berikut dijalankan dari root proyek. Di Windows, gunakan `python`
 
 4. Buka **http://127.0.0.1:8000**. Daftar akun lewat web, pilih menu, lalu checkout. Hentikan server dengan Ctrl+C. Data tetap ada setelah restart.
 
-Database default: `data/donnih.sqlite3`. Migrasi otomatis diterapkan saat startup. Gambar upload juga disimpan di database; tidak ada direktori upload tersembunyi atau cloud storage.
+Database name default: `PSOFP-db123`. Index dibuat saat startup. Gambar upload disimpan di MongoDB.
 
 ### Menyiapkan admin
 
@@ -69,7 +70,7 @@ Ganti alamat contoh dengan email akun yang Anda daftarkan, lalu masuk ulang agar
 python -m backend.cli create-admin --email email-anda@example.com --username adminanda --name "Admin Kedai"
 ```
 
-Tidak tersedia endpoint publik untuk menaikkan role. CLI memerlukan akses filesystem database. Jangan memberikan akses database/CLI kepada pengguna yang tidak dipercaya.
+Tidak tersedia endpoint publik untuk menaikkan role. CLI memerlukan akses ke MongoDB. Jangan memberikan akses database/CLI kepada pengguna yang tidak dipercaya.
 
 ### Mode pengembangan dengan HMR
 
@@ -93,25 +94,24 @@ Buka **http://127.0.0.1:5173**. Vite meneruskan `/api` dan `/uploads` ke `127.0.
 |---|---|---|
 | `HOST` | `127.0.0.1` | Bind lokal; jangan ubah ke publik tanpa hardening |
 | `PORT` | `8000` | Port API dan built frontend |
-| `DATABASE_PATH` | `data/donnih.sqlite3` | Path relatif terhadap direktori kerja, atau path absolut |
+| `MONGODB_URI` | `mongodb://localhost:27017` | URI koneksi MongoDB; simpan kredensial hanya di backend |
+| `MONGODB_DB_NAME` | `PSOFP-db123` | Nama database |
 | `SESSION_HOURS` | `168` | Masa sesi 1–720 jam |
 | `COOKIE_SECURE` | `false` | Gunakan `true` untuk HTTPS |
 | `WEB_ORIGINS` | localhost/127.0.0.1 port 5173 dan 8000 | Origin browser yang boleh mengirim mutasi |
 
-`.env` tidak masuk Git. Tidak ada service-role key, password produksi, secret frontend, atau kredensial Supabase yang perlu diisi untuk mode lokal. Menambahkan Supabase key saja **tidak** menghubungkan database ini ke Supabase.
+`.env` tidak masuk Git. Jangan masukkan URI MongoDB ke environment frontend. Untuk deploy, simpan URI pada konfigurasi environment AWS dan izinkan koneksi dari environment aplikasi.
 
 ## Arsitektur dan data
 
 ```text
 frontend/src/       React + TypeScript, CSS responsif, routing hash
 frontend/public/    Aset asli yang disalin dari sumber
-backend/server.py  HTTP, cookie, proteksi request, static files
+backend/server.py  HTTP server, cookie, proteksi request, static files
 backend/app.py     API, validasi/otorisasi, harga, checkout, status
-backend/db.py      Koneksi SQLite, migrasi, scrypt, seed eksplisit
+backend/db.py      MongoDB client, index, password hashing, seed eksplisit
 backend/cli.py     Setup database dan provisioning admin
-backend/migrations/001_initial.sql
-                    Skema berversi; bukan migrasi Supabase produksi
-tests/test_api.py   Tes HTTP/SQLite terisolasi
+tests/test_api.py   Tes API (fixture SQLite lama perlu diselaraskan dengan MongoDB)
 frontend/e2e/      Playwright dengan backend nyata + DB sementara
 docs/              Audit sumber, kontrak API, hasil verifikasi
 mobile-source/     Referensi lokal opsional (tidak masuk repository Git)
@@ -119,7 +119,7 @@ mobile-source/     Referensi lokal opsional (tidak masuk repository Git)
 
 Frontend mengirim JSON ke API same-origin. Server menentukan pemilik data dari sesi, bukan `user_id` klien. Harga berupa integer Rupiah dan dihitung ulang dari katalog aktif saat keranjang dimuat/checkout. Tidak ada pajak, ongkir, diskon, atau stok karena tidak ditemukan aturannya dalam sumber.
 
-Checkout menghitung harga, membuat order/detail/timeline, dan mengosongkan keranjang dalam satu transaksi SQLite. Kunci idempotensi unik per pengguna mengembalikan order yang sama pada retry. Nama, harga, gambar, dan topping disnapshot agar riwayat tidak berubah ketika katalog diedit. Item katalog diarsipkan alih-alih dihapus fisik.
+Checkout menghitung harga, membuat order/detail/timeline, dan mengosongkan keranjang menggunakan operasi MongoDB. Kunci idempotensi unik per pengguna mengembalikan order yang sama pada retry. Nama, harga, gambar, dan topping disnapshot agar riwayat tidak berubah ketika katalog diedit. Item katalog diarsipkan alih-alih dihapus fisik.
 
 **Pembayaran:** tunai di kasir adalah adaptasi label `Cash` di sumber. `payment_status` tetap `PENDING`, termasuk setelah pesanan `COMPLETED`; penyelesaian produksi bukan bukti uang diterima. Tidak ada tombol pelunasan, webhook, atau pembayaran online palsu.
 
@@ -128,20 +128,19 @@ Kontrak lengkap: [docs/API.md](docs/API.md). Pemetaan layar, temuan sumber, dan 
 ## Pengujian
 
 ```sh
-python -m unittest discover -s tests -v
+python -m compileall -q backend
 npm --prefix frontend run typecheck
+npm --prefix frontend run test:e2e:typecheck
 npm --prefix frontend run build
-npm --prefix frontend run test:e2e:install
-npm --prefix frontend run test:e2e
 ```
 
-Tes API menggunakan database sementara. E2E membangun frontend, menjalankan server nyata pada port sementara, membuat akun acak, menjalankan desktop/mobile Chromium, lalu membersihkan server/database. Tidak membuka database pribadi di `data/`. Unduhan browser hanya diperlukan sekali. Detail browser override dan laporan: [frontend/e2e/README.md](frontend/e2e/README.md).
+API dan browser test fixtures saat ini masih membuat database SQLite, sehingga belum kompatibel dengan backend MongoDB. Workflow CI menjalankan syntax check Python, typechecks frontend, smoke test API terhadap MongoDB sementara, dan production build. Runtime API/E2E suites perlu dipindahkan ke MongoDB sebelum dapat dijalankan. Detail cakupan lama: [frontend/e2e/README.md](frontend/e2e/README.md).
 
-Hasil terakhir dan cakupan/batas verifikasi: [docs/VERIFICATION.md](docs/VERIFICATION.md).
+Laporan [docs/VERIFICATION.md](docs/VERIFICATION.md) mencatat verifikasi versi SQLite sebelumnya dan bukan hasil verifikasi backend MongoDB saat ini.
 
 ## Repository GitHub
 
-Panduan push pertama, pemeriksaan staging, dan daftar file yang harus disertakan ada di [docs/GITHUB.md](docs/GITHUB.md). **Tidak ada konfigurasi CI/CD**; pemeriksaan dijalankan manual dengan perintah di atas. Mempublikasikan source code tidak otomatis menjalankan backend atau database di GitHub Pages.
+Panduan push pertama, pemeriksaan staging, dan daftar file yang harus disertakan ada di [docs/GITHUB.md](docs/GITHUB.md). Workflow `.github/workflows/deploy.yml` menjalankan pemeriksaan frontend dan Python lalu mendeploy ke EC2 melalui AWS Systems Manager (SSM) pada push ke `main`. Siapkan GitHub secrets `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, dan `AWS_INSTANCE_ID`, serta repository variables `AWS_REGION`, `EC2_APP_DIR`, dan `EC2_SERVICE_NAME`. Instance Ubuntu harus terdaftar di SSM, memiliki akses Git ke repository, Node.js, Python, dan service systemd yang sudah dikonfigurasi dengan environment MongoDB (`MONGODB_URI`, `MONGODB_DB_NAME`, `COOKIE_SECURE=true`, dan `WEB_ORIGINS`). Workflow memperbarui clone di `EC2_APP_DIR`, membangun frontend, lalu me-restart service bernama `EC2_SERVICE_NAME`.
 
 `package.json` root menyediakan pintasan `npm run setup:frontend`, `npm run dev`, `npm run build`, `npm run typecheck`, dan `npm run test:e2e`. Paket aplikasi dan lockfile utama tetap berada di `frontend/`; `npm install` di root saja tidak menginstal aplikasi frontend. Kedua lockfile disertakan untuk mereproduksi dependensinya masing-masing.
 
@@ -149,10 +148,10 @@ Database, sesi, upload, `.env`, `node_modules`, hasil build, laporan browser, da
 
 ## Backup, deployment, dan batas integrasi
 
-- Untuk backup lokal sederhana, hentikan server terlebih dahulu, kemudian salin database beserta file `-wal`/`-shm` jika masih ada. Untuk backup saat aplikasi aktif gunakan SQLite backup API; jangan menyalin file utama saja ketika WAL aktif.
-- Build dapat dilayani server Python dengan satu origin, tetapi **`http.server` standard library ini ditujukan untuk lokal, bukan server publik production-ready**. Sebelum deployment publik: gunakan server produksi/reverse proxy HTTPS, cookie Secure, origin eksplisit, pembatasan koneksi/request, observabilitas, backup/restore, dan audit keamanan. Jangan mengekspos Vite dev server.
+- Gunakan backup MongoDB yang dikelola penyedia database dan uji pemulihannya secara berkala.
+- Backend berjalan dengan HTTP server Python. `python -m backend.server` untuk lokal; deployment EC2 menjalankannya melalui service systemd. Atur `MONGODB_URI`, `MONGODB_DB_NAME`, `COOKIE_SECURE=true`, dan `WEB_ORIGINS` di environment service, dan batasi allowlist MongoDB ke jaringan aplikasi.
 - Rate limit auth lokal: maksimal 20 percobaan daftar/login per IP per 10 menit. Di belakang proxy, kode belum membaca forwarded IP; diperlukan konfigurasi proxy tepercaya sebelum produksi.
 - Upload dibatasi 2 MB per gambar dan 200 MB per akun; MIME dan signature diperiksa. Tidak ada re-encoding, pemindaian malware, atau validasi dimensi gambar. Gambar bersifat publik melalui URL acak, seperti asumsi bucket publik pada sumber; jangan unggah dokumen sensitif. Avatar lama dibersihkan, gambar menu dipertahankan demi riwayat.
 - Belum ada email confirmation/reset password, pembatalan/refund, stok, verifikasi pembayaran, atau Supabase Realtime. Pembaruan status menggunakan polling, bukan WebSocket.
-- Repository sumber tidak menyertakan schema/RLS/trigger/storage policy Supabase. Migrasi ke Supabase memerlukan verifikasi skema, Auth, ownership/RLS, storage policy, dan operasi checkout atomik server-side; data/akun lokal tidak otomatis bermigrasi. Midtrans memerlukan credential server dan webhook terverifikasi jika kelak ditambahkan.
+- Backend menggunakan koneksi MongoDB langsung; aplikasi mengelola autentikasi dan sesi sendiri. Midtrans memerlukan credential server dan webhook terverifikasi jika kelak ditambahkan.
 - Belum ada persyaratan deployment atau lisensi eksplisit yang ditemukan dalam snapshot sumber. Pastikan izin penggunaan kode/aset asli sebelum distribusi komersial.

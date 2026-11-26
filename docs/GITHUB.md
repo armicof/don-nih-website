@@ -1,12 +1,12 @@
-# Persiapan push ke GitHub — tanpa CI/CD
+# Persiapan push dan deployment ke GitHub
 
-File proyek disiapkan untuk version control. Tidak ada GitHub Actions, workflow deployment, atau konfigurasi CI/CD. Panduan ini **tidak berarti commit atau push sudah dilakukan**, dan GitHub Pages tidak dapat menjalankan API Python/SQLite aplikasi ini.
+Workflow `.github/workflows/deploy.yml` menjalankan pemeriksaan frontend/Python dan mendeploy ke EC2 melalui AWS Systems Manager (SSM) pada push ke `main`. Siapkan GitHub secrets `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, dan `AWS_INSTANCE_ID`, serta repository variables `AWS_REGION`, `EC2_APP_DIR`, dan `EC2_SERVICE_NAME`. Instance Ubuntu perlu terdaftar di SSM, memiliki akses Git ke repository, Node.js, Python, dan service systemd yang memakai konfigurasi MongoDB aplikasi. GitHub Pages tidak dapat menjalankan API Python aplikasi ini.
 
 ## 1. Apa yang masuk repository
 
 Sertakan:
 
-- `backend/` dan `backend/migrations/`: kode server dan skema, **bukan database berjalan**.
+- `backend/`: kode server dan setup collection/index MongoDB.
 - `frontend/src/`, `frontend/public/`, konfigurasi Vite/TypeScript/Playwright, `frontend/e2e/` (kode tes saja).
 - `tests/`, `docs/`, `README.md`, `THIRD_PARTY_NOTICES.md`.
 - `package.json` dan `package-lock.json` root serta frontend. Dependensi root yang sudah ada dipertahankan; aplikasi frontend dipasang terpisah.
@@ -15,7 +15,7 @@ Sertakan:
 Jangan sertakan:
 
 - `.env` atau konfigurasi lingkungan berisi rahasia.
-- `data/`, database SQLite, akun, sesi login, gambar upload pribadi, atau backup database.
+- file konfigurasi berisi URI/kredensial MongoDB, akun, sesi login, gambar upload pribadi, atau backup database.
 - `node_modules/`, `frontend/dist/`, cache Python, log, dan laporan/trace/screenshot E2E.
 - `mobile-source/`: snapshot sumber lokal opsional. Aset yang diperlukan sudah tersedia di `frontend/public/images/`.
 
@@ -27,14 +27,14 @@ Dari root, dengan Node 22+ dan Python 3.11+:
 
 ```sh
 npm --prefix frontend ci
-python -m unittest discover -s tests -v
-npm run typecheck
-npm run build
-npm run test:e2e:install
-npm run test:e2e
+python -m pip install -r requirements.txt
+python -m compileall -q backend
+npm --prefix frontend run typecheck
+npm --prefix frontend run test:e2e:typecheck
+npm --prefix frontend run build
 ```
 
-Pada Linux/macOS gunakan `python3` jika `python` tidak tersedia. Browser Playwright perlu diunduh sekali; Linux mungkin memerlukan dependensi sistem, lihat `frontend/e2e/README.md`. Tes membuat database sementara, bukan memakai `data/`.
+API and browser suites in `tests/` and `frontend/e2e/` still use SQLite fixtures and are not compatible with the MongoDB backend. The workflow runs an API smoke check using a temporary MongoDB service instead. Migrate those fixtures before relying on the older suite instructions in `frontend/e2e/README.md`.
 
 Kode/aset upstream tetap memiliki hak masing-masing. Baca `THIRD_PARTY_NOTICES.md`; lisensi sumber belum terverifikasi. Jangan menetapkan lisensi atau mempublikasikan materi pihak ketiga tanpa hak yang diperlukan.
 
@@ -92,7 +92,7 @@ Gunakan Git Credential Manager/GitHub CLI/SSH untuk autentikasi. Jangan menyisip
 ## 5. Verifikasi setelah push
 
 - Tinjau file melalui GitHub: source, aset, migration, dua lockfile, dan dokumentasi tersedia; database/secrets/build tidak ada.
-- Pastikan tab Actions tidak menampilkan workflow proyek; memang tidak disediakan CI/CD.
+- Pastikan tab Actions menjalankan workflow CI dan deployment SSM setelah push ke `main`.
 - Clone ke direktori baru untuk menguji instruksi README. Folder `mobile-source/`, root `node_modules/`, dan database pribadi tidak diperlukan oleh aplikasi.
 - Jalankan setup lokal seperti README dan buat akun/admin sendiri; tidak ada akun demo dengan password yang dibagikan.
 
