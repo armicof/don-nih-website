@@ -107,7 +107,7 @@ Buka **http://127.0.0.1:5173**. Vite meneruskan `/api` dan `/uploads` ke `127.0.
 ```text
 frontend/src/       React + TypeScript, CSS responsif, routing hash
 frontend/public/    Aset asli yang disalin dari sumber
-backend/server.py  HTTP server, cookie, proteksi request, static files
+backend/server.py  Flask app, cookie, proteksi request, static files
 backend/app.py     API, validasi/otorisasi, harga, checkout, status
 backend/db.py      MongoDB client, index, password hashing, seed eksplisit
 backend/cli.py     Setup database dan provisioning admin
@@ -140,7 +140,7 @@ Laporan [docs/VERIFICATION.md](docs/VERIFICATION.md) mencatat verifikasi versi S
 
 ## Repository GitHub
 
-Panduan push pertama, pemeriksaan staging, dan daftar file yang harus disertakan ada di [docs/GITHUB.md](docs/GITHUB.md). Workflow `.github/workflows/deploy.yml` menjalankan pemeriksaan frontend dan Python lalu mendeploy ke EC2 melalui AWS Systems Manager (SSM) pada push ke `main`. Siapkan GitHub secrets `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, dan `AWS_INSTANCE_ID`, serta repository variables `AWS_REGION`, `EC2_APP_DIR`, dan `EC2_SERVICE_NAME`. Instance Ubuntu harus terdaftar di SSM, memiliki akses Git ke repository, Node.js, Python, dan service systemd yang sudah dikonfigurasi dengan environment MongoDB (`MONGODB_URI`, `MONGODB_DB_NAME`, `COOKIE_SECURE=true`, dan `WEB_ORIGINS`). Workflow memperbarui clone di `EC2_APP_DIR`, membangun frontend, lalu me-restart service bernama `EC2_SERVICE_NAME`.
+Panduan push pertama, pemeriksaan staging, dan daftar file yang harus disertakan ada di [docs/GITHUB.md](docs/GITHUB.md). Workflow `.github/workflows/cd.yaml` mendeploy ke EC2 melalui AWS Systems Manager (SSM) setelah workflow CI berhasil pada `main`; Anda juga dapat menjalankannya manual dari `main`. Siapkan GitHub secrets `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, dan `AWS_INSTANCE_ID`, serta repository variables `AWS_REGION`, `EC2_APP_DIR`, dan `EC2_SERVICE_NAME`. Instance Ubuntu harus terdaftar di SSM, memiliki akses Git ke repository, Node.js, Python, dan service systemd Gunicorn yang sudah dikonfigurasi dengan environment MongoDB (`MONGODB_URI`, `MONGODB_DB_NAME`, `COOKIE_SECURE=true`, dan `WEB_ORIGINS`). Workflow memperbarui checkout di `EC2_APP_DIR` ke commit yang diuji CI, membangun frontend, lalu me-restart service.
 
 `package.json` root menyediakan pintasan `npm run setup:frontend`, `npm run dev`, `npm run build`, `npm run typecheck`, dan `npm run test:e2e`. Paket aplikasi dan lockfile utama tetap berada di `frontend/`; `npm install` di root saja tidak menginstal aplikasi frontend. Kedua lockfile disertakan untuk mereproduksi dependensinya masing-masing.
 
@@ -149,7 +149,7 @@ Database, sesi, upload, `.env`, `node_modules`, hasil build, laporan browser, da
 ## Backup, deployment, dan batas integrasi
 
 - Gunakan backup MongoDB yang dikelola penyedia database dan uji pemulihannya secara berkala.
-- Backend berjalan dengan HTTP server Python. `python -m backend.server` untuk lokal; deployment EC2 menjalankannya melalui service systemd. Atur `MONGODB_URI`, `MONGODB_DB_NAME`, `COOKIE_SECURE=true`, dan `WEB_ORIGINS` di environment service, dan batasi allowlist MongoDB ke jaringan aplikasi.
+- Backend berjalan dengan Flask. `python -m backend.server` untuk lokal; deployment WSGI menggunakan Gunicorn (`backend.server:app`). Deployment EC2 menjalankan service systemd. Atur `MONGODB_URI`, `MONGODB_DB_NAME`, `COOKIE_SECURE=true`, dan `WEB_ORIGINS` di environment service, dan batasi allowlist MongoDB ke jaringan aplikasi.
 - Rate limit auth lokal: maksimal 20 percobaan daftar/login per IP per 10 menit. Di belakang proxy, kode belum membaca forwarded IP; diperlukan konfigurasi proxy tepercaya sebelum produksi.
 - Upload dibatasi 2 MB per gambar dan 200 MB per akun; MIME dan signature diperiksa. Tidak ada re-encoding, pemindaian malware, atau validasi dimensi gambar. Gambar bersifat publik melalui URL acak, seperti asumsi bucket publik pada sumber; jangan unggah dokumen sensitif. Avatar lama dibersihkan, gambar menu dipertahankan demi riwayat.
 - Belum ada email confirmation/reset password, pembatalan/refund, stok, verifikasi pembayaran, atau Supabase Realtime. Pembaruan status menggunakan polling, bukan WebSocket.

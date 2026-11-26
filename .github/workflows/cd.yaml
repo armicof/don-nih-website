@@ -1,0 +1,125 @@
+name: CD — Deploy to AWS EC2 via SSM
+
+on:
+  workflow_run:
+    workflows: ["CI — Don.Nih! (Frontend, Backend & MongoDB)"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: donnih-production-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy production on EC2
+    runs-on: ubuntu-latest
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_INSTANCE_ID: ${{ secrets.AWS_INSTANCE_ID }}
+      EC2_APP_DIR: ${{ vars.EC2_APP_DIR }}
+      EC2_SERVICE_NAME: ${{ vars.EC2_SERVICE_NAME }}
+      DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+    steps:
+      - name: Check out deployed revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Validate deployment settings
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${AWS_REGION:?Set the AWS_REGION repository variable}"
+          : "${AWS_INSTANCE_ID:?Set the AWS_INSTANCE_ID secret}"
+          : "${EC2_APP_DIR:?Set the EC2_APP_DIR repository variable}"
+          : "${EC2_SERVICE_NAME:?Set the EC2_SERVICE_NAME repository variable}"
+          [[ "$AWS_INSTANCE_ID" =~ ^i-[0-9a-fA-F]+$ ]] || { echo "AWS_INSTANCE_ID format is invalid"; exit 1; }
+          [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "Deployment commit SHA is invalid"; exit 1; }
+          [[ "$EC2_APP_DIR" == /* ]] || { echo "EC2_APP_DIR must be an absolute path"; exit 1; }
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build SSM deployment command
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import shlex
+
+          app_dir = shlex.quote(os.environ["EC2_APP_DIR"])
+          service = shlex.quote(os.environ["EC2_SERVICE_NAME"])
+          revision = shlex.quote(os.environ["DEPLOY_SHA"])
+          deploy = (
+              f"set -e; cd {app_dir}; git fetch origin main; "
+              f"git reset --hard {revision}; "
+              "python3 -m venv .venv; "
+              ".venv/bin/python -m pip install -r requirements.txt; "
+              "npm --prefix frontend ci; npm --prefix frontend run build; "
+              f"sudo systemctl restart {service}"
+          )
+          command = "sudo -u ubuntu bash -lc " + shlex.quote(deploy)
+          with open("ssm-parameters.json", "w", encoding="utf-8") as output:
+              json.dump({"commands": [command]}, output)
+          PY
+
+      - name: Send deployment through Systems Manager
+        id: send
+        shell: bash
+        run: |
+          set -euo pipefail
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$AWS_INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters file://ssm-parameters.json \
+            --comment "Don.Nih! deploy ${DEPLOY_SHA}" \
+            --query "Command.CommandId" \
+            --output text)
+          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+          echo "SSM command: $COMMAND_ID"
+
+      - name: Wait for deployment to finish
+        shell: bash
+        env:
+          COMMAND_ID: ${{ steps.send.outputs.command_id }}
+        run: |
+          set -euo pipefail
+          for attempt in {1..60}; do
+            DETAILS=$(aws ssm list-command-invocations \
+              --details \
+              --instance-id "$AWS_INSTANCE_ID" \
+              --command-id "$COMMAND_ID" \
+              --output json)
+            STATUS=$(jq -r '.CommandInvocations[0].Status // "Pending"' <<< "$DETAILS")
+            case "$STATUS" in
+              Success)
+                jq -r '.CommandInvocations[0].CommandPlugins[] | .Output' <<< "$DETAILS"
+                echo "Deployment of ${DEPLOY_SHA} succeeded."
+                exit 0
+                ;;
+              Failed|Cancelled|TimedOut|Cancelling)
+                jq -r '.CommandInvocations[0].CommandPlugins[]? | "Status: \(.Status)\nOutput: \(.Output)\nError: \(.Error)"' <<< "$DETAILS"
+                exit 1
+                ;;
+              *) sleep 5 ;;
+            esac
+          done
+          echo "Timed out waiting for SSM command ${COMMAND_ID}"
+          exit 1
