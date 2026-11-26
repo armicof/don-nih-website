@@ -218,7 +218,7 @@ class Application:
             return Response([public_record(row) for row in rows])
         user = self.require_user(user, path.startswith('/api/admin/'))
         uid = user['id']
-        
+
         if path == '/api/profile' and method == 'PATCH':
             name = text(body.get('fullname', user['fullname']), 'Nama lengkap', 2, 100)
             number = phone(body.get('phone_number', user.get('phone_number', '')))
@@ -458,33 +458,37 @@ class Application:
         key = text(body.get('idempotency_key'), 'Kunci checkout', 16, 100)
         if not re.fullmatch(r'[A-Za-z0-9_-]+', key):
             raise ApiError(400, 'Kunci checkout tidak valid.')
+
         previous = db['orders'].find_one({'user_id': user['id'], 'idempotency_key': key}, {'id': 1})
         if previous:
-            return Response(self.order(db, previous['id']))
+            return Response(self.order(db, previous['id']), 200)
+
         cart = self.cart(db, user['id'])
         if not cart['items']:
+            previous = db['orders'].find_one({'user_id': user['id'], 'idempotency_key': key}, {'id': 1})
+            if previous:
+                return Response(self.order(db, previous['id']), 200)
             raise ApiError(400, 'Keranjang masih kosong.')
         if not all(item['available'] for item in cart['items']):
             raise ApiError(409, 'Menu atau topping tidak tersedia. Hapus item tersebut dari keranjang.')
 
         timestamp = now()
         oid = _next_seq(db, 'orders')
-        order_details = []
-        for item in cart['items']:
-            order_details.append(
-                {
-                    'id': _next_seq(db, 'order_details'),
-                    'order_id': oid,
-                    'menu_id': item['menu_id'],
-                    'name': item['name'],
-                    'img': item['img'],
-                    'quantity': item['quantity'],
-                    'price': item['unit_price'],
-                    'toppings_json': json.dumps(
-                        [{'id': t['id'], 'name': t['name'], 'price': t['price']} for t in item['toppings']]
-                    ),
-                }
-            )
+        order_details = [
+            {
+                'id': _next_seq(db, 'order_details'),
+                'order_id': oid,
+                'menu_id': item['menu_id'],
+                'name': item['name'],
+                'img': item['img'],
+                'quantity': item['quantity'],
+                'price': item['unit_price'],
+                'toppings_json': json.dumps(
+                    [{'id': t['id'], 'name': t['name'], 'price': t['price']} for t in item['toppings']]
+                ),
+            }
+            for item in cart['items']
+        ]
 
         try:
             db['orders'].insert_one(
@@ -500,7 +504,12 @@ class Application:
                 }
             )
         except DuplicateKeyError:
-            existing_order = db['orders'].find_one({'user_id': user['id'], 'idempotency_key': key}, {'id': 1})
+            existing_order = None
+            for _ in range(50):
+                existing_order = db['orders'].find_one({'user_id': user['id'], 'idempotency_key': key}, {'id': 1})
+                if existing_order:
+                    break
+                time.sleep(0.02)
             if existing_order:
                 db['order_events'].update_one(
                     {'order_id': existing_order['id'], 'status': 'WAITING'},
@@ -515,6 +524,10 @@ class Application:
                     },
                     upsert=True,
                 )
+                for _ in range(50):
+                    if db['order_details'].count_documents({'order_id': existing_order['id']}) > 0:
+                        break
+                    time.sleep(0.02)
                 return Response(self.order(db, existing_order['id']), 200)
             raise
 
@@ -534,7 +547,19 @@ class Application:
         if order_details:
             db['order_details'].insert_many(order_details)
         db['carts'].delete_many({'user_id': user['id']})
-        return Response(self.order(db, oid), 201)
+
+        order_data = self.order(db, oid)
+        if order_details and not order_data.get('items'):
+            order_data['items'] = [
+                {
+                    **{k: v for k, v in d.items() if k not in ('_id', 'toppings_json')},
+                    'toppings': json.loads(d['toppings_json']),
+                    'total': d['quantity'] * d['price'],
+                }
+                for d in order_details
+            ]
+        return Response(order_data, 201)
+
     @staticmethod
     def order(db: Database[Any], oid: int) -> dict[str, Any]:
         row = db['orders'].find_one({'id': oid})
