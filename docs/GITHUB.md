@@ -1,6 +1,6 @@
 # Persiapan push dan deployment ke GitHub
 
-Workflow `.github/workflows/deploy.yml` menjalankan pemeriksaan frontend/Python dan mendeploy ke EC2 melalui AWS Systems Manager (SSM) pada push ke `main`. Siapkan GitHub secrets `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, dan `AWS_INSTANCE_ID`, serta repository variables `AWS_REGION`, `EC2_APP_DIR`, dan `EC2_SERVICE_NAME`. Instance Ubuntu perlu terdaftar di SSM, memiliki akses Git ke repository, Node.js, Python, dan service systemd yang memakai konfigurasi MongoDB aplikasi. GitHub Pages tidak dapat menjalankan API Python aplikasi ini.
+Workflow `.github/workflows/cd.yaml` mendeploy ke EC2 melalui AWS Systems Manager (SSM) setelah workflow CI berhasil pada `main`; workflow juga dapat dijalankan manual dari branch `main`. Siapkan GitHub secrets `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, dan `AWS_INSTANCE_ID`, serta repository variables `AWS_REGION`, `EC2_APP_DIR`, dan `EC2_SERVICE_NAME`. Credential GitHub perlu hak SSM untuk `SendCommand` dan `ListCommandInvocations` pada instance tujuan serta dokumen `AWS-RunShellScript`. Instance Ubuntu harus terdaftar sebagai managed node di SSM (SSM Agent aktif dan instance profile berisi `AmazonSSMManagedInstanceCore`), memiliki akses Git ke repository, Node.js, Python, dan service systemd Gunicorn. Service perlu dijalankan sebagai `ubuntu`, membaca environment MongoDB dari konfigurasi service, dan mengizinkan `ubuntu` merestart service tanpa prompt password. `EC2_APP_DIR` harus direktori absolut yang bisa ditulis user `ubuntu`. GitHub Pages tidak dapat menjalankan API Python aplikasi ini.
 
 ## 1. Apa yang masuk repository
 
@@ -34,7 +34,7 @@ npm --prefix frontend run test:e2e:typecheck
 npm --prefix frontend run build
 ```
 
-API and browser suites in `tests/` and `frontend/e2e/` still use SQLite fixtures and are not compatible with the MongoDB backend. The workflow runs an API smoke check using a temporary MongoDB service instead. Migrate those fixtures before relying on the older suite instructions in `frontend/e2e/README.md`.
+API and browser suites in `tests/` and `frontend/e2e/` still use SQLite fixtures and are not compatible with the MongoDB backend. CI compiles the backend and runs an API smoke check using a temporary MongoDB service instead. Migrate those fixtures before relying on the older suite instructions in `frontend/e2e/README.md`.
 
 Kode/aset upstream tetap memiliki hak masing-masing. Baca `THIRD_PARTY_NOTICES.md`; lisensi sumber belum terverifikasi. Jangan menetapkan lisensi atau mempublikasikan materi pihak ketiga tanpa hak yang diperlukan.
 
@@ -92,7 +92,7 @@ Gunakan Git Credential Manager/GitHub CLI/SSH untuk autentikasi. Jangan menyisip
 ## 5. Verifikasi setelah push
 
 - Tinjau file melalui GitHub: source, aset, migration, dua lockfile, dan dokumentasi tersedia; database/secrets/build tidak ada.
-- Pastikan tab Actions menjalankan workflow CI dan deployment SSM setelah push ke `main`.
+- Pastikan tab Actions menjalankan workflow CI dan deployment SSM setelah push ke `main`. Pantau hasil perintah SSM pada langkah “Wait for deployment to finish”.
 - Clone ke direktori baru untuk menguji instruksi README. Folder `mobile-source/`, root `node_modules/`, dan database pribadi tidak diperlukan oleh aplikasi.
 - Jalankan setup lokal seperti README dan buat akun/admin sendiri; tidak ada akun demo dengan password yang dibagikan.
 
