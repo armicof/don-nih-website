@@ -44,6 +44,20 @@ def create_app(
     flask_app = Flask(__name__)
     flask_app.config['MAX_CONTENT_LENGTH'] = MAX_BODY
 
+    @flask_app.before_request
+    def _validate_content_length_header():
+        raw_cl = request.headers.get('Content-Length')
+        if raw_cl is not None:
+            raw_cl = raw_cl.strip()
+            try:
+                length = int(raw_cl)
+            except ValueError:
+                return jsonify({'error': 'Header Content-Length tidak valid.'}), 400
+            if length < 0:
+                return jsonify({'error': 'Ukuran body melebihi batas.'}), 413
+            if length > MAX_BODY:
+                return jsonify({'error': 'Ukuran body melebihi batas.'}), 413
+
     @flask_app.after_request
     def add_security_headers(response):
         response.headers.setdefault('Cache-Control', 'no-store')
