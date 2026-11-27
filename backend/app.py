@@ -511,24 +511,15 @@ class Application:
                     break
                 time.sleep(0.02)
             if existing_order:
-                db['order_events'].update_one(
-                    {'order_id': existing_order['id'], 'status': 'WAITING'},
-                    {
-                        '$setOnInsert': {
-                            'id': _next_seq(db, 'order_events'),
-                            'order_id': existing_order['id'],
-                            'status': 'WAITING',
-                            'actor_id': user['id'],
-                            'created_at': timestamp,
-                        }
-                    },
-                    upsert=True,
-                )
-                for _ in range(50):
-                    if db['order_details'].count_documents({'order_id': existing_order['id']}) > 0:
-                        break
+                expected_details = len(order_details)
+                deadline = time.monotonic() + 10
+                while True:
+                    completed_order = self.order(db, existing_order['id'])
+                    if len(completed_order['items']) == expected_details and completed_order['events']:
+                        return Response(completed_order, 200)
+                    if time.monotonic() >= deadline:
+                        raise ApiError(503, 'Checkout sedang diproses. Coba lagi dengan kunci checkout yang sama.')
                     time.sleep(0.02)
-                return Response(self.order(db, existing_order['id']), 200)
             raise
 
         db['order_events'].update_one(
