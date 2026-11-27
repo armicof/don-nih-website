@@ -1,157 +1,183 @@
-# Kedai Don.Nih! — versi web full-stack
+# ☕ Kedai Don.Nih!
 
-Adaptasi web dari [raffidevaa/don.nih](https://github.com/raffidevaa/don.nih). Identitas cokelat/krem, aset menu asli, pilihan ukuran/suhu, dan alur pelanggan/admin dipertahankan serta disesuaikan untuk web responsif. Snapshot Flutter `mobile-source/` hanya referensi lokal opsional, diabaikan Git, dan **tidak diperlukan** untuk install, build, atau menjalankan aplikasi setelah clone.
+Kedai Don.Nih! adalah aplikasi point of sale berbasis web untuk kedai kopi. Pelanggan dapat menjelajahi menu, menyesuaikan pesanan, lalu melakukan checkout. Admin mengelola katalog dan memperbarui status pesanan melalui dashboard.
 
-**Ini aplikasi lokal yang berfungsi, bukan koneksi ke data kedai produksi.** Katalog seed menggunakan nama/aset sumber, tetapi harga, deskripsi, dan extra topping adalah **contoh rekaan**. Tidak ada akun bawaan, transaksi uang, sinkronisasi Supabase, atau pembayaran Midtrans. Database menggunakan MongoDB yang ditentukan melalui `MONGODB_URI`.
+## 📌 Fitur
 
-## Fitur
+- Registrasi, login, logout, dan profil pengguna.
+- Katalog menu dengan pencarian dan kategori.
+- Detail menu dengan pilihan ukuran, suhu, dan topping.
+- Favorit dan keranjang yang tersimpan.
+- Checkout dengan harga yang dihitung di server dan perlindungan retry menggunakan idempotency key.
+- Riwayat dan detail pesanan beserta statusnya.
+- Upload foto profil dan gambar menu.
+- Dashboard admin untuk mengelola menu, topping, dan status pesanan.
 
-- Jelajah katalog tanpa login; pencarian serta lima kategori.
-- Daftar, masuk/keluar, sesi cookie HttpOnly; akses pelanggan/admin di server.
-- Detail menu: Regular/Large, Cold/Hot, extra topping dengan kalkulasi harga.
-- Favorit; keranjang dengan kuantitas persisten; checkout atomik dan aman terhadap retry identik.
-- Riwayat/detail pesanan, snapshot item/harga/topping, dan timeline waktu sebenarnya.
-- Status `WAITING → CONFIRMED → PROCESSED → COMPLETED`; polling setiap lima detik.
-- Profil: nama, nomor telepon, unggah avatar PNG/JPEG/WebP.
-- Admin: tambah/edit/arsipkan/aktifkan menu dan extra topping, gambar menu, harga ukuran/suhu, filter serta pembaruan pesanan.
-- Navigasi desktop/mobile, dialog keyboard, fokus, loading, error, empty state, serta pemberitahuan sukses.
+> Pembayaran online belum tersedia. Pelanggan membayar di kasir.
 
-## Prasyarat
+## 🧰 Teknologi
 
-- Node.js **22+**, npm, Python **3.11+**, dan MongoDB (lokal, Atlas, atau compatible service).
-- Pasang backend dependency dengan `python -m pip install -r requirements.txt`.
-- Internet hanya diperlukan untuk instalasi npm dan browser pengujian pertama kali. Aset/font aplikasi tidak bergantung CDN.
+| Bagian | Teknologi |
+| --- | --- |
+| Frontend | React, TypeScript, Vite |
+| Backend dan API | Python, Flask |
+| Database | MongoDB |
+| Pengujian browser | Playwright |
 
-Semua perintah berikut dijalankan dari root proyek. Di Windows, gunakan `python`; di Linux/macOS biasanya `python3`.
+## 🚀 Menjalankan secara lokal
 
-## Jalankan lokal — satu server
+### Prasyarat
 
-1. Salin `.env.example` ke `.env` (opsional; nilai default sudah dapat digunakan):
+- Python 3.11 atau lebih baru.
+- Node.js 22 atau lebih baru dan npm.
+- MongoDB lokal atau MongoDB Atlas yang dapat diakses.
 
-   ```powershell
-   Copy-Item .env.example .env
-   ```
-
-   Pada Linux/macOS gunakan `cp .env.example .env`.
-
-2. Install dependency, bangun frontend, dan siapkan MongoDB beserta katalog **demo**:
-
-   ```sh
-   python -m pip install -r requirements.txt
-   npm --prefix frontend ci
-   npm --prefix frontend run build
-   python -m backend.cli init --demo
-   ```
-
-   Untuk katalog kosong, gunakan `python -m backend.cli init` tanpa `--demo`.
-   Seed hanya dijalankan secara eksplisit, idempoten, dan menolak katalog nonkosong yang belum pernah di-seed. Server tidak mengisi katalog otomatis.
-
-3. Jalankan:
-
-   ```sh
-   python -m backend.server
-   ```
-
-4. Buka **http://127.0.0.1:8000**. Daftar akun lewat web, pilih menu, lalu checkout. Hentikan server dengan Ctrl+C. Data tetap ada setelah restart.
-
-Database name default: `PSOFP-db123`. Index dibuat saat startup. Gambar upload disimpan di MongoDB.
-
-### Menyiapkan admin
-
-Setelah mendaftarkan akun milik Anda lewat web, jalankan di terminal lain:
+### 1. Clone dan siapkan konfigurasi
 
 ```sh
-python -m backend.cli promote-admin --email email-anda@example.com
+git clone https://github.com/armicof/don-nih-website.git
+cd don-nih-website
 ```
 
-Ganti alamat contoh dengan email akun yang Anda daftarkan, lalu masuk ulang agar UI mengenali role admin. Alternatif membuat akun admin baru (password diminta tersembunyi, tidak melalui argumen CLI):
+Salin `.env.example` menjadi `.env`:
 
 ```sh
-python -m backend.cli create-admin --email email-anda@example.com --username adminanda --name "Admin Kedai"
+# Windows PowerShell
+Copy-Item .env.example .env
+
+# macOS / Linux
+cp .env.example .env
 ```
 
-Tidak tersedia endpoint publik untuk menaikkan role. CLI memerlukan akses ke MongoDB. Jangan memberikan akses database/CLI kepada pengguna yang tidak dipercaya.
+Lalu isi alamat MongoDB. Contoh konfigurasi untuk MongoDB lokal:
 
-### Mode pengembangan dengan HMR
+```dotenv
+HOST=127.0.0.1
+PORT=8000
+MONGODB_URI=mongodb://127.0.0.1:27017
+MONGODB_DB_NAME=donnih_local
+SESSION_HOURS=168
+COOKIE_SECURE=false
+WEB_ORIGINS=http://localhost:5173,http://127.0.0.1:5173,http://localhost:8000,http://127.0.0.1:8000
+```
 
-Terminal 1, dari root:
+Jangan commit `.env` atau kredensial database. Untuk MongoDB Atlas, gunakan connection string dari project Anda dan simpan dengan aman.
+
+### 2. Instal dependensi backend
+
+Buat dan aktifkan virtual environment, lalu instal paket Python:
+
+```sh
+python -m venv .venv
+```
+
+Aktifkan environment:
+
+```sh
+# Windows PowerShell
+.venv\Scripts\Activate.ps1
+
+# macOS / Linux
+source .venv/bin/activate
+```
+
+Kemudian jalankan:
+
+```sh
+python -m pip install -r requirements.txt
+```
+
+### 3. Inisialisasi database
+
+Perintah ini membuat collection dan index yang diperlukan serta mengisi katalog contoh:
+
+```sh
+python -m backend.cli init --demo
+```
+
+Data demo hanya untuk pengembangan. Untuk menyiapkan database tanpa katalog contoh, jalankan `python -m backend.cli init`.
+
+### 4. Buat akun admin
+
+```sh
+python -m backend.cli create-admin --email admin@example.com --username admin --name "Admin Kedai"
+```
+
+Masukkan password saat diminta. Password tidak ditampilkan di terminal.
+
+### 5. Instal dependensi frontend
+
+Dari direktori root repository:
+
+```sh
+npm --prefix frontend ci
+```
+
+### 6. Jalankan aplikasi
+
+Jalankan backend dan frontend pada dua terminal terpisah. Aktifkan virtual environment di terminal backend.
+
+Terminal pertama:
 
 ```sh
 python -m backend.server
 ```
 
-Terminal 2, dari root:
+Terminal kedua:
 
 ```sh
-npm --prefix frontend run dev
+npm run dev
 ```
 
-Buka **http://127.0.0.1:5173**. Vite meneruskan `/api` dan `/uploads` ke `127.0.0.1:8000`; gambar asli dilayani dari `frontend/public/images`. Jika mengubah port backend, sesuaikan `frontend/vite.config.ts` dan `WEB_ORIGINS`. Jangan gunakan `vite preview` sebagai backend aplikasi; jalankan build lewat server Python di atas.
+Buka alamat yang ditampilkan Vite, biasanya [http://localhost:5173](http://localhost:5173). Vite meneruskan permintaan API dan gambar upload ke backend lokal pada port 8000.
 
-## Konfigurasi
+Untuk membangun frontend produksi dan menyajikannya melalui backend, jalankan:
 
-| Variabel | Default | Kegunaan |
-|---|---|---|
-| `HOST` | `127.0.0.1` | Bind lokal; jangan ubah ke publik tanpa hardening |
-| `PORT` | `8000` | Port API dan built frontend |
-| `MONGODB_URI` | `mongodb://localhost:27017` | URI koneksi MongoDB; simpan kredensial hanya di backend |
-| `MONGODB_DB_NAME` | `PSOFP-db123` | Nama database |
-| `SESSION_HOURS` | `168` | Masa sesi 1–720 jam |
-| `COOKIE_SECURE` | `false` | Gunakan `true` untuk HTTPS |
-| `WEB_ORIGINS` | localhost/127.0.0.1 port 5173 dan 8000 | Origin browser yang boleh mengirim mutasi |
+```sh
+npm run build
+python -m backend.server
+```
 
-`.env` tidak masuk Git. Jangan masukkan URI MongoDB ke environment frontend. Untuk deploy, simpan URI pada konfigurasi environment AWS dan izinkan koneksi dari environment aplikasi.
+Lalu buka [http://localhost:8000](http://localhost:8000).
 
-## Arsitektur dan data
+## 🧪 Pemeriksaan
+
+Tes integrasi backend memerlukan MongoDB yang dapat diakses melalui `MONGODB_URI`:
+
+```sh
+python -m unittest discover -s tests -p "test_*.py" -v
+```
+
+Pemeriksaan frontend dan browser tersedia melalui `npm run typecheck`, `npm run build`, dan `npm run test:e2e`. Untuk pertama kali menjalankan tes browser, instal Chromium dengan `npm run test:e2e:install`.
+
+## 📁 Struktur proyek
 
 ```text
-frontend/src/       React + TypeScript, CSS responsif, routing hash
-frontend/public/    Aset asli yang disalin dari sumber
-backend/server.py  Flask app, cookie, proteksi request, static files
-backend/app.py     API, validasi/otorisasi, harga, checkout, status
-backend/db.py      MongoDB client, index, password hashing, seed eksplisit
-backend/cli.py     Setup database dan provisioning admin
-tests/test_api.py   Tes API (fixture SQLite lama perlu diselaraskan dengan MongoDB)
-frontend/e2e/      Playwright dengan backend nyata + DB sementara
-docs/              Audit sumber, kontrak API, hasil verifikasi
-mobile-source/     Referensi lokal opsional (tidak masuk repository Git)
+.
+├── backend/
+│   ├── app.py              # Endpoint API, autentikasi, checkout, dan aturan bisnis
+│   ├── cli.py              # Inisialisasi database dan pengelolaan akun admin
+│   ├── db.py               # Koneksi MongoDB, index, dan data demo
+│   └── server.py           # Server Flask dan penyajian frontend hasil build
+├── frontend/
+│   ├── e2e/                # Skenario end-to-end Playwright
+│   ├── public/             # Aset statis
+│   └── src/                # Kode React dan TypeScript
+├── tests/                  # Tes integrasi API
+├── docs/                   # Dokumentasi API, verifikasi, dan deployment
+├── .env.example            # Template konfigurasi lokal
+└── README.md
 ```
 
-Frontend mengirim JSON ke API same-origin. Server menentukan pemilik data dari sesi, bukan `user_id` klien. Harga berupa integer Rupiah dan dihitung ulang dari katalog aktif saat keranjang dimuat/checkout. Tidak ada pajak, ongkir, diskon, atau stok karena tidak ditemukan aturannya dalam sumber.
+## 📚 Dokumentasi
 
-Checkout menghitung harga, membuat order/detail/timeline, dan mengosongkan keranjang menggunakan operasi MongoDB. Kunci idempotensi unik per pengguna mengembalikan order yang sama pada retry. Nama, harga, gambar, dan topping disnapshot agar riwayat tidak berubah ketika katalog diedit. Item katalog diarsipkan alih-alih dihapus fisik.
+- [Kontrak API](docs/API.md)
+- [Verifikasi dan pemeriksaan](docs/VERIFICATION.md)
+- [Panduan GitHub dan deployment](docs/GITHUB.md)
+- [Pemberitahuan lisensi pihak ketiga](THIRD_PARTY_NOTICES.md)
 
-**Pembayaran:** tunai di kasir adalah adaptasi label `Cash` di sumber. `payment_status` tetap `PENDING`, termasuk setelah pesanan `COMPLETED`; penyelesaian produksi bukan bukti uang diterima. Tidak ada tombol pelunasan, webhook, atau pembayaran online palsu.
+## ℹ️ Catatan
 
-Kontrak lengkap: [docs/API.md](docs/API.md). Pemetaan layar, temuan sumber, dan alasan perbedaan: [docs/SOURCE_AUDIT.md](docs/SOURCE_AUDIT.md).
-
-## Pengujian
-
-```sh
-python -m compileall -q backend
-npm --prefix frontend run typecheck
-npm --prefix frontend run test:e2e:typecheck
-npm --prefix frontend run build
-```
-
-API dan browser test fixtures saat ini masih membuat database SQLite, sehingga belum kompatibel dengan backend MongoDB. Workflow CI menjalankan syntax check Python, typechecks frontend, smoke test API terhadap MongoDB sementara, dan production build. Runtime API/E2E suites perlu dipindahkan ke MongoDB sebelum dapat dijalankan. Detail cakupan lama: [frontend/e2e/README.md](frontend/e2e/README.md).
-
-Laporan [docs/VERIFICATION.md](docs/VERIFICATION.md) mencatat verifikasi versi SQLite sebelumnya dan bukan hasil verifikasi backend MongoDB saat ini.
-
-## Repository GitHub
-
-Panduan push pertama, pemeriksaan staging, dan daftar file yang harus disertakan ada di [docs/GITHUB.md](docs/GITHUB.md). Workflow `.github/workflows/cd.yaml` mendeploy ke EC2 melalui AWS Systems Manager (SSM) setelah workflow CI berhasil pada `main`; Anda juga dapat menjalankannya manual dari `main`. Siapkan GitHub secrets `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, dan `AWS_INSTANCE_ID`, serta repository variables `AWS_REGION`, `EC2_APP_DIR`, dan `EC2_SERVICE_NAME`. Instance Ubuntu harus terdaftar di SSM, memiliki akses Git ke repository, Node.js, Python, dan service systemd Gunicorn yang sudah dikonfigurasi dengan environment MongoDB (`MONGODB_URI`, `MONGODB_DB_NAME`, `COOKIE_SECURE=true`, dan `WEB_ORIGINS`). Workflow memperbarui checkout di `EC2_APP_DIR` ke commit yang diuji CI, membangun frontend, lalu me-restart service.
-
-`package.json` root menyediakan pintasan `npm run setup:frontend`, `npm run dev`, `npm run build`, `npm run typecheck`, dan `npm run test:e2e`. Paket aplikasi dan lockfile utama tetap berada di `frontend/`; `npm install` di root saja tidak menginstal aplikasi frontend. Kedua lockfile disertakan untuk mereproduksi dependensinya masing-masing.
-
-Database, sesi, upload, `.env`, `node_modules`, hasil build, laporan browser, dan snapshot Flutter lokal diabaikan Git. `.env.example` adalah pengecualian yang harus berisi konfigurasi contoh aman saja. Untuk atribusi dan batas lisensi kode/aset sumber, lihat [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
-
-## Backup, deployment, dan batas integrasi
-
-- Gunakan backup MongoDB yang dikelola penyedia database dan uji pemulihannya secara berkala.
-- Backend berjalan dengan Flask. `python -m backend.server` untuk lokal; deployment WSGI menggunakan Gunicorn (`backend.server:app`). Deployment EC2 menjalankan service systemd. Atur `MONGODB_URI`, `MONGODB_DB_NAME`, `COOKIE_SECURE=true`, dan `WEB_ORIGINS` di environment service, dan batasi allowlist MongoDB ke jaringan aplikasi.
-- Rate limit auth lokal: maksimal 20 percobaan daftar/login per IP per 10 menit. Di belakang proxy, kode belum membaca forwarded IP; diperlukan konfigurasi proxy tepercaya sebelum produksi.
-- Upload dibatasi 2 MB per gambar dan 200 MB per akun; MIME dan signature diperiksa. Tidak ada re-encoding, pemindaian malware, atau validasi dimensi gambar. Gambar bersifat publik melalui URL acak, seperti asumsi bucket publik pada sumber; jangan unggah dokumen sensitif. Avatar lama dibersihkan, gambar menu dipertahankan demi riwayat.
-- Belum ada email confirmation/reset password, pembatalan/refund, stok, verifikasi pembayaran, atau Supabase Realtime. Pembaruan status menggunakan polling, bukan WebSocket.
-- Backend menggunakan koneksi MongoDB langsung; aplikasi mengelola autentikasi dan sesi sendiri. Midtrans memerlukan credential server dan webhook terverifikasi jika kelak ditambahkan.
-- Belum ada persyaratan deployment atau lisensi eksplisit yang ditemukan dalam snapshot sumber. Pastikan izin penggunaan kode/aset asli sebelum distribusi komersial.
+- Akun yang dibuat melalui registrasi memiliki peran pelanggan. Buat akun admin menggunakan CLI di atas, atau promosikan akun yang sudah ada dengan `python -m backend.cli promote-admin --email alamat@email.com`.
+- Pada deployment HTTPS, atur `COOKIE_SECURE=true` dan gunakan nilai `WEB_ORIGINS` yang sesuai dengan domain aplikasi.
+- Jangan gunakan katalog demo sebagai daftar harga produksi.
